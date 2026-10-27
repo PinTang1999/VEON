@@ -52,7 +52,9 @@ class SANInVeonTemporal(nn.Module):
         self.clip_visual_extractor = clip_visual_extractor
         self.clip_rec_head = clip_rec_head
         self.ov_classifier = ov_classifier
-        self.ov_classifier_weight = None
+        self.register_buffer('ov_classifier_weight', None, persistent=False)
+        self._vocabulary = None
+        self._classifier_cache_version = None
         # self.criterion = criterion
         self.occ_decoder = occ_decoder
 
@@ -113,6 +115,7 @@ class SANInVeonTemporal(nn.Module):
     def forward(self, images, depth, img_metas, adj_metas):
         # get classifier weight for each dataset
         # !! Could be computed once and saved. It will run only once per dataset.
+        self._ensure_classifier_weight()
         B, N, C, H, W = images.shape
         images = images.view(B * N, C, H, W)
 
@@ -165,7 +168,10 @@ class SANInVeonTemporal(nn.Module):
                 # Prepare 3D early feature for previous frame
                 offsets_prev, attns_prev, supp_prev = self.highres_side_adaptor_network(images_prev, clip_image_features_prev)
                 clip_image_features_prev = self.clip_rec_head.update_remaining_clip_feats(clip_image_features_prev, offsets_prev, attns_prev)
-                occ_feat_prev = self.occ_decoder.forward_early(sem_embed_ds_prev, clip_image_features_prev, [supp_prev], depth_prev, img_metas_prev)
+                occ_feat_prev = self.occ_decoder.forward_early(
+                    sem_embed_ds_prev, clip_image_features_prev, [supp_prev],
+                    depth_prev, img_metas_prev,
+                    reference_ego2global=adj_metas[1 + tid])
 
                 # Occ feat Transform
                 adj_metas_prev = [adj_metas[0], adj_metas[1 + tid]]
@@ -191,8 +197,9 @@ class SANInVeonTemporal(nn.Module):
         outputs['clip_feat'] = clip_image_features['clip_feat_proj']
 
         # Inference 3D
-        occ_preds = self.occ_decoder(sem_embed_ds, clip_image_features, [supp], 
-                                     depth, img_metas, occ_feat_prevs)
+        occ_preds = self.occ_decoder(
+            sem_embed_ds, clip_image_features, [supp], depth, img_metas,
+            occ_feat_prevs, reference_ego2global=adj_metas[0])
         feat_occ = F.interpolate(
             occ_preds["feat_occ"],
             size=self.occ_size,
@@ -259,11 +266,33 @@ class SANInVeonTemporal(nn.Module):
         return semocc
 
     def prepare_vocabulary(self, vocabulary):
-        self.ov_classifier_weight = (
-                self.ov_classifier.logit_scale.exp()
-                * self.ov_classifier.get_classifier_by_vocabulary(vocabulary)
-        )
-        self.ov_classifier_weight = self.ov_classifier_weight.clone().detach()
+        self._vocabulary = tuple(vocabulary)
+        self.ov_classifier_weight = None
+        self._ensure_classifier_weight()
+
+    def _ensure_classifier_weight(self):
+        if self._vocabulary is None:
+            raise RuntimeError('Call prepare_vocabulary before running SAN inference.')
+        cache_version = getattr(self.ov_classifier, '_cache_version', None)
+        if (self.ov_classifier_weight is None
+                or self._classifier_cache_version != cache_version):
+            with torch.no_grad():
+                self.ov_classifier_weight = (
+                    self.ov_classifier.logit_scale.exp()
+                    * self.ov_classifier.get_classifier_by_vocabulary(self._vocabulary)
+                ).detach()
+            self._classifier_cache_version = cache_version
+        return self.ov_classifier_weight
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # Child classifier parameters are loaded after this call. Invalidate
+        # here and rebuild on the first forward, once the full load is done.
+        self.ov_classifier_weight = None
+        self._classifier_cache_version = None
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys,
+            unexpected_keys, error_msgs)
 
     def retrieval_embedding(self, vocabulary):
         retrieval_embedding = (

@@ -37,6 +37,7 @@ class VeonTemporal(Base3DDetector):
         test_cfg = None,
         mode="nuscenes",
         retrieval=False,
+        retrieval_queries=None,
         use_depth_estimator=False,
         depth_mode = "zoedepth",
         **kwargs
@@ -75,6 +76,7 @@ class VeonTemporal(Base3DDetector):
         self._freeze_stages()
         self.nonce = 1
         self.retrieval = retrieval
+        self.retrieval_queries = retrieval_queries
 
     def train(self, mode=True):
         """
@@ -230,6 +232,13 @@ class VeonTemporal(Base3DDetector):
 
         self.nonce += 1
         if self.retrieval:
+            if self.retrieval_queries is not None:
+                # Labels and visibility are deliberately absent from this API.
+                scores = self.score_retrieval_queries(
+                    semantic_results['feat_occ'].squeeze(0).permute(0, 3, 2, 1).contiguous(),
+                    kwargs['points_indices'][0].squeeze(0), self.retrieval_queries)
+                return [dict(scores=scores.cpu().numpy(), voxel_indices=
+                             kwargs['points_indices'][0].squeeze(0).cpu().numpy())]
             occ_res = self.compute_single_retrieval(
                 bin_occ_softmax.squeeze(dim=0).permute(2, 1, 0).contiguous(),
                 semantic_results['feat_occ'].squeeze(dim=0).permute(0, 3, 2, 1).contiguous(),
@@ -327,6 +336,25 @@ class VeonTemporal(Base3DDetector):
                 fn_sum[j] += fn
 
         return tp_sum, fp_sum, fn_sum
+
+    def score_retrieval_queries(self, occ_feat, indices, prompts):
+        """Cosine scores [queries, points], independent of all annotations."""
+        if not prompts:
+            raise ValueError('At least one retrieval query is required')
+        indices = indices.long()
+        if indices.ndim != 2 or indices.shape[1] != 3:
+            raise ValueError('Point indices must have shape [N,3]')
+        for axis, size in enumerate(occ_feat.shape[1:]):
+            if ((indices[:, axis] < 0) | (indices[:, axis] >= size)).any():
+                raise ValueError('Point index outside voxel grid')
+        points_feat = occ_feat[:, indices[:, 0], indices[:, 1], indices[:, 2]]
+        text = self.semantic_model.model.retrieval_embedding(prompts)
+        if text.shape[1] != points_feat.shape[0]:
+            raise ValueError('Text encoder and voxel embedding dimensions disagree')
+        # Matrix multiplication avoids materializing [queries, channels, points].
+        # Normalize each vector with the same eps as the legacy cosine scorer.
+        return F.normalize(text.float(), dim=1, eps=1e-8) @ F.normalize(
+            points_feat.float(), dim=0, eps=1e-8)
 
     def compute_single_retrieval(self, occ_bin, occ_feat, indices, matching_points, anno, prompt=""):
 

@@ -116,6 +116,10 @@ class MEGVIIEMAHook(Hook):
             'state_dict': state_dict,
             'updates': runner.ema_model.updates
         }
+        # Ablation checkpoints must retain the frozen vocabulary/config policy.
+        # Preserve the original EMA format for all existing training configs.
+        if runner.meta and 'vocabulary_generalization' in runner.meta:
+            ema_checkpoint['meta'] = runner.meta.copy()
         save_path = f'epoch_{runner.epoch+1}_ema.pth'
         save_path = os.path.join(runner.work_dir, save_path)
         torch.save(ema_checkpoint, save_path)

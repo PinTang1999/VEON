@@ -37,6 +37,8 @@ class OccLossFB(BaseModule):
         stage2_start=2, 
         priority=None,
         ov_class_number=17,
+        priority_mode='original',
+        semantic_supervision='legacy',
     ):
         super(OccLossFB, self).__init__()
 
@@ -86,7 +88,8 @@ class OccLossFB(BaseModule):
         self.bin_occ_loss = BCE_BinOcc_Loss
         self.proj2dto3dloss = Proj2Dto3DLoss(ov_class_number=ov_class_number, grid_config=grid_config,
                                                 high_conf_thr=high_conf_thr, stage2_start=stage2_start, 
-                                                priority=priority)
+                                                priority=priority, priority_mode=priority_mode,
+                                                semantic_supervision=semantic_supervision)
 
         self.ov_class_number = ov_class_number
 

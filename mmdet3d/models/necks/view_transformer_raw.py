@@ -208,27 +208,34 @@ class LSSViewTransformerRaw(BaseModule):
             interval_starts, interval_lengths = \
             self.voxel_pooling_prepare_v2(coor)
 
+        if ranks_bev is None:
+            self.ranks_bev = self.ranks_feat = self.ranks_depth = None
+            self.interval_starts = self.interval_lengths = None
+            return
         self.ranks_bev = ranks_bev.int().contiguous()
         self.ranks_feat = ranks_feat.int().contiguous()
         self.ranks_depth = ranks_depth.int().contiguous()
         self.interval_starts = interval_starts.int().contiguous()
         self.interval_lengths = interval_lengths.int().contiguous()
 
+    def _empty_bev_feature(self, depth, feat):
+        # BEVPoolv2 returns B,C,Z,Y,X before optionally collapsing Z.
+        bev_feat = feat.new_zeros((
+            feat.shape[0], feat.shape[2], int(self.grid_size[2]),
+            int(self.grid_size[1]), int(self.grid_size[0])))
+        # Retain a zero gradient path when every frustum point is out of bounds.
+        bev_feat = bev_feat + feat.reshape(-1)[:0].sum() + \
+            depth.reshape(-1)[:0].sum()
+        if self.collapse_z:
+            bev_feat = torch.cat(bev_feat.unbind(dim=2), 1)
+        return bev_feat
+
     def voxel_pooling_v2(self, coor, depth, feat):
         ranks_bev, ranks_depth, ranks_feat, \
             interval_starts, interval_lengths = \
             self.voxel_pooling_prepare_v2(coor)
         if ranks_feat is None:
-            print('warning ---> no points within the predefined '
-                  'bev receptive field')
-            dummy = torch.zeros(size=[
-                feat.shape[0], feat.shape[2],
-                int(self.grid_size[2]),
-                int(self.grid_size[0]),
-                int(self.grid_size[1])
-            ]).to(feat)
-            dummy = torch.cat(dummy.unbind(dim=2), 1)
-            return dummy
+            return self._empty_bev_feature(depth, feat)
         feat = feat.permute(0, 1, 3, 4, 2)
         bev_feat_shape = (depth.shape[0], int(self.grid_size[2]),
                           int(self.grid_size[1]), int(self.grid_size[0]),
@@ -257,28 +264,25 @@ class LSSViewTransformerRaw(BaseModule):
         B, N, D, H, W, _ = coor.shape
         num_points = B * N * D * H * W
         # record the index of selected points for acceleration purpose
-        ranks_depth = torch.range(
-            0, num_points - 1, dtype=torch.int, device=coor.device)
-        ranks_feat = torch.range(
-            0, num_points // D - 1, dtype=torch.int, device=coor.device)
+        ranks_depth = torch.arange(
+            num_points, dtype=torch.int, device=coor.device)
+        ranks_feat = torch.arange(
+            num_points // D, dtype=torch.int, device=coor.device)
         ranks_feat = ranks_feat.reshape(B, N, 1, H, W)
         ranks_feat = ranks_feat.expand(B, N, D, H, W).flatten()
-        # convert coordinate into the voxel space
+        # Check continuous coordinates before integer conversion. A cast to long
+        # truncates (-1, 0) to zero and would admit points below the lower bound.
         coor = ((coor - self.grid_lower_bound.to(coor)) /
-                self.grid_interval.to(coor))
-        coor = coor.long().view(num_points, 3)
-        batch_idx = torch.range(0, B - 1).reshape(B, 1). \
-            expand(B, num_points // B).reshape(num_points, 1).to(coor)
-        coor = torch.cat((coor, batch_idx), 1)
-
-        # filter out points that are outside box
-        kept = (coor[:, 0] >= 0) & (coor[:, 0] < self.grid_size[0]) & \
-               (coor[:, 1] >= 0) & (coor[:, 1] < self.grid_size[1]) & \
-               (coor[:, 2] >= 0) & (coor[:, 2] < self.grid_size[2])
-        if len(kept) == 0:
+                self.grid_interval.to(coor)).reshape(num_points, 3)
+        grid_size = self.grid_size.to(coor)
+        kept = torch.isfinite(coor).all(dim=1) & \
+            ((coor >= 0) & (coor < grid_size)).all(dim=1)
+        if not kept.any():
             return None, None, None, None, None
-        coor, ranks_depth, ranks_feat = \
-            coor[kept], ranks_depth[kept], ranks_feat[kept]
+        batch_idx = torch.arange(B, device=coor.device).reshape(B, 1). \
+            expand(B, num_points // B).reshape(num_points, 1)
+        coor = torch.cat((coor[kept].long(), batch_idx[kept]), 1)
+        ranks_depth, ranks_feat = ranks_depth[kept], ranks_feat[kept]
         # get tensors from the same voxel next to each other
         ranks_bev = coor[:, 3] * (
             self.grid_size[2] * self.grid_size[1] * self.grid_size[0])
@@ -313,17 +317,20 @@ class LSSViewTransformerRaw(BaseModule):
         # Lift-Splat
         if self.accelerate:
             feat = tran_feat.view(B, N, self.out_channels, H, W)
-            feat = feat.permute(0, 1, 3, 4, 2)
             depth = depth.view(B, N, self.D, H, W)
-            bev_feat_shape = (depth.shape[0], int(self.grid_size[2]),
-                              int(self.grid_size[1]), int(self.grid_size[0]),
-                              feat.shape[-1])  # (B, Z, Y, X, C)
-            bev_feat = bev_pool_v2(depth, feat, self.ranks_depth,
-                                   self.ranks_feat, self.ranks_bev,
-                                   bev_feat_shape, self.interval_starts,
-                                   self.interval_lengths)
-
-            bev_feat = bev_feat.squeeze(2)
+            if self.ranks_feat is None:
+                bev_feat = self._empty_bev_feature(depth, feat)
+            else:
+                feat = feat.permute(0, 1, 3, 4, 2)
+                bev_feat_shape = (depth.shape[0], int(self.grid_size[2]),
+                                  int(self.grid_size[1]), int(self.grid_size[0]),
+                                  feat.shape[-1])  # (B, Z, Y, X, C)
+                bev_feat = bev_pool_v2(depth, feat, self.ranks_depth,
+                                       self.ranks_feat, self.ranks_bev,
+                                       bev_feat_shape, self.interval_starts,
+                                       self.interval_lengths)
+                if self.collapse_z:
+                    bev_feat = torch.cat(bev_feat.unbind(dim=2), 1)
         else:
             coor = self.get_lidar_coor(*input[1:7])
             bev_feat = self.voxel_pooling_v2(
@@ -397,84 +404,68 @@ class LSSViewTransformerRaw(BaseModule):
                              downsample, 1)
         depths = depths.permute(0, 1, 3, 5, 2, 4).contiguous()
         depths = depths.view(-1, downsample * downsample)
-        depths_tmp = torch.where(depths == 0.0,
-                                 1e5 * torch.ones_like(depths), depths)
+        depths_tmp = torch.where(torch.isfinite(depths) & (depths > 0),
+                                 depths, 1e5 * torch.ones_like(depths))
         depths = torch.min(depths_tmp, dim=-1).values
         depths = depths.view(B, N, H // downsample, W // downsample)
         return depths
 
-    def get_two_hot_depth(self, depths, gamma=4, downsample=False):
-        """
-        Input:
-            gt_depths: [B, N, H, W]
-        Output:
-            gt_depths: [B*N*h*w, d]
+    def _depth_encoding_inputs(self, depths, downsample, mask_invalid):
+        """Use exactly the physical depth representatives used by lifting.
+
+        The extra upper-bound bin absorbs probability beyond the last frustum
+        plane and is discarded from the returned distribution.
         """
         if downsample:
             depths = self.downsample_depth(depths, self.downsample)
-        B, N, H, W = depths.shape
-        depths = depths.view(B * N, H, W)
-        bin_centers = torch.arange(self.D + 1, device=depths.device) * self.grid_config['depth'][2] + \
-                      (self.grid_config['depth'][0] + self.grid_config['depth'][2] / 2)
-        depths = depths.view(-1, H, W, 1).repeat(1, 1, 1, self.D + 1)
-        gap = -torch.abs(depths - bin_centers[None, None, None, :]) * gamma
-        MIN_GAP = -16
-        gap = torch.where(gap >= MIN_GAP, gap, gap + (MIN_GAP - gap.detach()))
-        # gap = torch.permute(gap, (0, 3, 1, 2))
-        # depth_dist = self.to_dist(gap).permute((0, 2, 3, 1))
-        depth_dist = torch.softmax(gap, dim=-1)
-        # depth_dist = torch.clamp_min(depth_dist, min=1e-7)
-        depth_dist = depth_dist.view(-1, self.D + 1)[:, :-1]
-        depth_dist = depth_dist.view(B, N, H, W, self.D).permute(0, 1, 4, 2, 3)
-        return depth_dist
+        if depths.dtype in (torch.float16, torch.bfloat16):
+            depths = depths.float()
+        finite = torch.isfinite(depths)
+        valid = finite & (depths > 0) & \
+            (depths >= self.grid_config['depth'][0]) & \
+            (depths < self.grid_config['depth'][1])
+        kept = valid if mask_invalid else finite
+        # Sanitize before softmax: multiplying NaN probabilities by zero later
+        # would still contaminate both the output and backward pass.
+        depths = torch.where(kept, depths, depths.new_tensor(
+            self.grid_config['depth'][0]))
+        bin_centers = self.frustum[:, 0, 0, 2].to(depths)
+        bin_centers = torch.cat((bin_centers, depths.new_tensor([
+            self.grid_config['depth'][1]])))
+        gap = -torch.abs(depths.unsqueeze(-1) - bin_centers)
+        return gap, kept
+
+    def get_two_hot_depth(self, depths, gamma=4, downsample=False,
+                          mask_invalid=True):
+        """Encode [B, N, H, W] metric depths as [B, N, D, H, W].
+
+        Lifting ignores nonfinite and out-of-range depths. The auxiliary depth
+        loss can disable the range mask to preserve its softmax/BCE objective.
+        """
+        gap, kept = self._depth_encoding_inputs(
+            depths, downsample, mask_invalid)
+        depth_dist = torch.softmax(gap * gamma, dim=-1)[..., :-1]
+        depth_dist = depth_dist * kept.unsqueeze(-1)
+        return depth_dist.permute(0, 1, 4, 2, 3)
 
     def get_one_hot_depth(self, depths, downsample=False):
-        """
-        Input:
-            gt_depths: [B, N, H, W]
-        Output:
-            gt_depths: [B*N*h*w, d]
-        """
-        if downsample:
-            depths = self.downsample_depth(depths, self.downsample)
-        B, N, H, W = depths.shape
-        depths = depths.view(B * N, H, W).clamp_max(max=500)
-        bin_centers = torch.arange(self.D + 1, device=depths.device) * self.grid_config['depth'][2] + \
-                      (self.grid_config['depth'][0] + self.grid_config['depth'][2] / 2)
-        depths = depths.view(-1, H, W, 1).repeat(1, 1, 1, self.D + 1)
-        gap = -torch.abs(depths - bin_centers[None, None, None, :])
-        # depth_dist = torch.nn.functional.gumbel_softmax(gap, tau=1.0, hard=True)
-        def hard_max(logits, dim):
-            # y_soft = torch.softmax(logits, dim=dim)
-            index = logits.max(dim, keepdim=True)[1]
-            y_hard = torch.zeros_like(logits).scatter_(dim, index, 1.0)
-            # ret = y_hard - y_soft.detach() + y_soft
-            return y_hard
-        depth_dist = hard_max(gap, dim=-1)
-        depth_dist = depth_dist.view(-1, self.D + 1)[:, :-1]
-        depth_dist = depth_dist.view(B, N, H, W, self.D).permute(0, 1, 4, 2, 3)
-        return depth_dist
+        """Encode valid depths at the nearest lifting depth representative."""
+        gap, kept = self._depth_encoding_inputs(depths, downsample, True)
+        # Every valid metric depth has a hard label, including depths between
+        # the last frustum plane and the exclusive upper bound.
+        gap = gap[..., :-1]
+        index = gap.max(dim=-1, keepdim=True)[1]
+        depth_dist = torch.zeros_like(gap).scatter_(-1, index, 1.0)
+        depth_dist = depth_dist * kept.unsqueeze(-1)
+        return depth_dist.permute(0, 1, 4, 2, 3)
 
     def get_one_hot_depth_gumbel(self, depths, downsample=False, gamma=5):
-        """
-        Input:
-            gt_depths: [B, N, H, W]
-        Output:
-            gt_depths: [B*N*h*w, d]
-        """
-        if downsample:
-            depths = self.downsample_depth(depths, self.downsample)
-        B, N, H, W = depths.shape
-        depths = depths.view(B * N, H, W).clamp_max(max=500)
-        bin_centers = torch.arange(self.D + 1, device=depths.device) * self.grid_config['depth'][2] + \
-                      (self.grid_config['depth'][0] + self.grid_config['depth'][2] / 2)
-        depths = depths.view(-1, H, W, 1).repeat(1, 1, 1, self.D + 1)
-        gap = -torch.abs(depths - bin_centers[None, None, None, :]) * gamma
-        gap_prob = torch.softmax(gap, dim=-1)
-        depth_dist = torch.nn.functional.gumbel_softmax(gap_prob, tau=1.0, hard=True)
-        depth_dist = depth_dist.view(-1, self.D + 1)[:, :-1]
-        depth_dist = depth_dist.view(B, N, H, W, self.D).permute(0, 1, 4, 2, 3)
-        return depth_dist
+        """Sample valid lifting depth representatives with straight-through gradients."""
+        gap, kept = self._depth_encoding_inputs(depths, downsample, True)
+        depth_dist = F.gumbel_softmax(gap[..., :-1] * gamma,
+                                     tau=1.0, hard=True)
+        depth_dist = depth_dist * kept.unsqueeze(-1)
+        return depth_dist.permute(0, 1, 4, 2, 3)
 
     @force_fp32()
     def get_depth_loss(self, depth_labels, depth_preds):
@@ -512,7 +503,8 @@ class LSSViewTransformerRaw(BaseModule):
 
         if ce:
             depth_labels = self.get_one_hot_depth(depth_labels_orig)
-            depth_preds = self.get_two_hot_depth(depth_preds_orig)
+            depth_preds = self.get_two_hot_depth(
+                depth_preds_orig, mask_invalid=False)
             if len(depth_preds.shape) == 5:
                 B, N, C, H, W = depth_preds.shape
                 depth_preds = depth_preds.reshape(-1, C, H, W)

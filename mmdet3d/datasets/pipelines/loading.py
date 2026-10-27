@@ -18,6 +18,9 @@ from ..builder import PIPELINES
 
 @PIPELINES.register_module()
 class LoadOccGTFromFile(object):
+    def __init__(self, occupancy_only=False):
+        self.occupancy_only = occupancy_only
+
     def __call__(self, results):
 
         if 'occ_gt_path' not in results:
@@ -28,6 +31,9 @@ class LoadOccGTFromFile(object):
 
         occ_labels = np.load(occ_gt_path)
         semantics = occ_labels['semantics']
+        if self.occupancy_only:
+            semantics = semantics.copy()
+            semantics[(semantics >= 0) & (semantics < 17)] = 0
         mask_lidar = occ_labels['mask_lidar']
         mask_camera = occ_labels['mask_camera']
 
@@ -1332,10 +1338,11 @@ class PrepareImageInputs(object):
 @PIPELINES.register_module()
 class LoadAnnotationsBEVDepth(object):
 
-    def __init__(self, bda_aug_conf, classes, is_train=True):
+    def __init__(self, bda_aug_conf, classes, is_train=True, geometry_only=False):
         self.bda_aug_conf = bda_aug_conf
         self.is_train = is_train
         self.classes = classes
+        self.geometry_only = geometry_only
 
     def sample_bda_augmentation(self):
         """Generate bda augmentation values based on bda_config."""
@@ -1384,7 +1391,7 @@ class LoadAnnotationsBEVDepth(object):
         return gt_boxes, rot_mat
 
     def __call__(self, results):
-        if 'anno_infos' in results:
+        if not self.geometry_only and 'anno_infos' in results:
             gt_boxes, gt_labels = results['ann_infos']
             gt_boxes, gt_labels = torch.Tensor(gt_boxes), torch.tensor(gt_labels)
             rotate_bda, scale_bda, flip_dx, flip_dy = self.sample_bda_augmentation()

@@ -145,18 +145,25 @@ class TemporalDeformable(nn.Module):
         offsets = offsets.view(B, self.num_heads, self.num_samples, 3, D, H, W)
         offsets = offsets.permute(0, 1, 4, 5, 6, 2, 3)  # (B, H, D, H, W, N, 3)
 
-        # Create base grid
-        z = torch.linspace(-1, 1, D, device=device)
-        y = torch.linspace(-1, 1, H, device=device)
-        x = torch.linspace(-1, 1, W, device=device)
+        # grid_sample expects (x, y, z), even though tensors are (D, H, W).
+        z = (torch.linspace(-1, 1, D, device=device, dtype=offsets.dtype)
+             if D > 1 else offsets.new_zeros(1))
+        y = (torch.linspace(-1, 1, H, device=device, dtype=offsets.dtype)
+             if H > 1 else offsets.new_zeros(1))
+        x = (torch.linspace(-1, 1, W, device=device, dtype=offsets.dtype)
+             if W > 1 else offsets.new_zeros(1))
         zz, yy, xx = torch.meshgrid(z, y, x, indexing='ij')
-        base_grid = torch.stack((zz, yy, xx), dim=-1)  # (D, H, W, 3)
+        base_grid = torch.stack((xx, yy, zz), dim=-1)  # (D, H, W, 3)
         base_grid = base_grid[None, None].expand(B, self.num_heads, -1, -1, -1, -1)  # (B, H, D, H, W, 3)
 
-        # Add offsets (normalized)
-        sampling_grid = base_grid.unsqueeze(5) + offsets / torch.tensor(
-            [D, H, W], device=device
-        ).view(1, 1, 1, 1, 1, 1, 3)
+        # Offsets are (x, y, z) displacements in voxels. With aligned
+        # corners, one voxel spans 2 / (size - 1) normalized coordinates.
+        offset_scale = offsets.new_tensor([
+            2.0 / (W - 1) if W > 1 else 0.0,
+            2.0 / (H - 1) if H > 1 else 0.0,
+            2.0 / (D - 1) if D > 1 else 0.0,
+        ])
+        sampling_grid = base_grid.unsqueeze(5) + offsets * offset_scale
 
         sampling_grid = sampling_grid.clamp(-1, 1)
         sampling_grid = sampling_grid.view(B * self.num_heads, D, H, W, self.num_samples, 3)
@@ -238,12 +245,13 @@ class AlignNetOcc3D(nn.Module):
     def forward(self, sem_feat: torch.tensor,
                 clip_features: List, supp_features: List,
                 depth: torch.Tensor, img_metas: List, 
-                occ_feat_prevs: List[torch.Tensor] = None):
+                occ_feat_prevs: List[torch.Tensor] = None,
+                reference_ego2global: torch.Tensor = None):
 
         # Prepare for 3d issues
         depth = self.prepare_depth(depth)
         if self.lss_view_transformer.mode == 'nuscenes':
-            img_metas = self.prepare_meta(img_metas)
+            img_metas = self.prepare_meta(img_metas, reference_ego2global)
         h, w = clip_features[1].shape[2:]
         H, W = sem_feat.shape[2:]
         x = None
@@ -267,12 +275,13 @@ class AlignNetOcc3D(nn.Module):
 
     def forward_early(self, sem_feat: torch.tensor,
                 clip_features: List, supp_features: List,
-                depth: torch.Tensor, img_metas: List):
+                depth: torch.Tensor, img_metas: List,
+                reference_ego2global: torch.Tensor = None):
 
         # Prepare for 3d issues
         depth = self.prepare_depth(depth)
         if self.lss_view_transformer.mode == 'nuscenes':
-            img_metas = self.prepare_meta(img_metas)
+            img_metas = self.prepare_meta(img_metas, reference_ego2global)
         h, w = clip_features[1].shape[2:]
         H, W = sem_feat.shape[2:]
         x = None
@@ -325,15 +334,20 @@ class AlignNetOcc3D(nn.Module):
         two_hot_depth = self.lss_view_transformer.get_two_hot_depth(depth_ds)
         return two_hot_depth
 
-    def prepare_meta(self, img_metas):
+    def prepare_meta(self, img_metas, reference_ego2global):
 
         N = self.num_camera
         sensor2egos, ego2globals, intrins, post_rots, post_trans, bda = img_metas
         sensor2egos = sensor2egos.view(-1, self.num_frame, N, 4, 4)
         ego2globals = ego2globals.view(-1, self.num_frame, N, 4, 4)
 
-        # Calculate the transformation from sweep sensor to key ego
-        keyego2global = ego2globals[:, 0, 0, ...].unsqueeze(1).unsqueeze(1)
+        # Occupancy labels, projection loss and temporal warping use the
+        # LiDAR-time ego frame, not any individual camera's ego frame.
+        if reference_ego2global is None:
+            raise ValueError('LiDAR ego pose is required for occupancy lifting')
+        if reference_ego2global.dim() == 4:
+            reference_ego2global = reference_ego2global[:, 0]
+        keyego2global = reference_ego2global[:, None, None]
         global2keyego = torch.inverse(keyego2global.double())
         sensor2keyegos = \
             global2keyego @ ego2globals.double() @ sensor2egos.double()
@@ -349,7 +363,7 @@ class AlignNetOcc3D(nn.Module):
         extra = [torch.split(t, 1, 1) for t in extra]
         extra = [[p.squeeze(1) for p in t] for t in extra]
         sensor2keyegos, ego2globals, intrins, post_rots, post_trans = extra
-        return [sensor2keyegos[0], ego2globals[0], intrins[0], post_rots[0], post_trans[0], bda[0]]
+        return [sensor2keyegos[0], ego2globals[0], intrins[0], post_rots[0], post_trans[0], bda]
 
     def prepare_feat_for_lifting(self, feats_2d):
         _, C, H, W = feats_2d.shape

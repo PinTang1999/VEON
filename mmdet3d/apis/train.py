@@ -315,14 +315,15 @@ def train_detector(model,
         cfg.resume_from = resume_from
     if cfg.resume_from:
         runner.resume(cfg.resume_from)
-    if cfg.load_from and cfg.resume_from is None:
-        rk = cfg.revise_keys if 'revise_keys' in cfg else []
-        runner.load_checkpoint(cfg.load_from, revise_keys=rk)
-    # Loading the existing depth net
-    if 'depth_load_from' in cfg:
-        rk = cfg.depth_revise_keys if 'depth_revise_keys' in cfg else []
-        runner.load_checkpoint(cfg.depth_load_from, revise_keys=rk)
-        # runner.load_checkpoint(cfg.depth_load_from)
+    else:
+        # A resumed checkpoint already contains the trained depth network and
+        # matching optimizer state. Pretrained weights only initialize new runs.
+        if cfg.load_from:
+            rk = cfg.revise_keys if 'revise_keys' in cfg else []
+            runner.load_checkpoint(cfg.load_from, revise_keys=rk)
+        if cfg.get('depth_load_from'):
+            rk = cfg.depth_revise_keys if 'depth_revise_keys' in cfg else []
+            runner.load_checkpoint(cfg.depth_load_from, revise_keys=rk)
     runner.run(data_loaders, cfg.workflow)
 
 

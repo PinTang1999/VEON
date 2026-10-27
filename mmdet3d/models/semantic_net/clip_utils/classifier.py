@@ -28,8 +28,30 @@ class PredefinedOvClassifier(nn.Module):
         self._freeze()
 
         self.cache_feature = cache_feature
+        self._cache_version = 0
         if self.cache_feature:
             self.cache = {}
+
+    def clear_cache(self):
+        # Text features depend on the encoder weights, device and dtype.
+        if self.cache_feature:
+            self.cache.clear()
+        self._cache_version += 1
+
+    def _apply(self, fn):
+        result = super()._apply(fn)
+        # The dictionary is not a registered buffer and cannot follow .to().
+        self.clear_cache()
+        return result
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # Both torch and MMCV's recursive checkpoint loader call this method.
+        # Recompute lazily, after all child modules have loaded their weights.
+        self.clear_cache()
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys,
+            unexpected_keys, error_msgs)
 
     def forward(self, category_names: List[str]):
         text_embed_bucket = []

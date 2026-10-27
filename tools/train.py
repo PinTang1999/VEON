@@ -193,6 +193,8 @@ def main():
     # init the meta dict to record some important information such as
     # environment info and seed, which will be logged
     meta = dict()
+    if cfg.get('vocabulary_generalization') is not None:
+        meta['vocabulary_generalization'] = cfg.vocabulary_generalization
     # log env info
     env_info_dict = collect_env()
     env_info = '\n'.join([(f'{k}: {v}') for k, v in env_info_dict.items()])

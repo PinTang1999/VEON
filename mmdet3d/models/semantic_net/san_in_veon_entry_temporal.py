@@ -26,6 +26,7 @@ import torch.nn as nn
 
 from .configs.san_config import add_san_config
 from .vocabulary.nuscenes_vol import NUSCENES_CLASSES, NUSCENES_CLASSES_BRIEF
+from .vocabulary.generalization import load_manifest, merge_superclasses
 from .vocabulary.semkitti_vol import SEMKITTI_CLASSES_BRIEF
 from .vocabulary.coco_vol import COCO_CATEGORIES
 # from san.data.datasets.register_coco_stuff_164k import COCO_CATEGORIES
@@ -59,7 +60,8 @@ def setup(model_type: str, device=None):
 class SANInVeonEntryTemporal(nn.Module):
     def __init__(self, model_type: str, vocabulary: str, occ_size: Tuple[int],
                  num_frame: int = 1, num_camera: int = 6, num_temporal: int = 1,
-                 grid_config: Dict = None, ds_feat: List[int] = None, ):
+                 grid_config: Dict = None, ds_feat: List[int] = None,
+                 vocabulary_file=None, vocabulary_spec=None):
         """
         Args:
             model_type (str): the config file path
@@ -72,6 +74,10 @@ class SANInVeonEntryTemporal(nn.Module):
         cfg.freeze()
         self.model = DefaultTrainer.build_model(cfg)
         self.grid_config, self.ds_feat = grid_config, ds_feat
+        if vocabulary_file is not None and vocabulary_spec is not None:
+            raise ValueError('Specify only one of vocabulary_file and vocabulary_spec')
+        self.vocabulary_spec = load_manifest(vocabulary_spec or vocabulary_file) \
+            if vocabulary_spec is not None or vocabulary_file is not None else None
         self.prepare_vocabulary(augment_vocabulary=vocabulary)
         self.num_frame, self.num_camera, self.occ_size = num_frame, num_camera, occ_size
 
@@ -91,13 +97,20 @@ class SANInVeonEntryTemporal(nn.Module):
             Union[dict, None]: the segmentation result
         """
 
-        vocabulary = list(set([v.lower().strip() for v in vocabulary]))
+        vocabulary = list(dict.fromkeys(v.lower().strip() for v in vocabulary))
         # Remove invalid vocabulary
         vocabulary = [v for v in vocabulary if v != ""]
         detailed_description = [v for v in vocabulary if v != ""]
         class_reflection = [i for i in range(len(vocabulary))]
 
-        if augment_vocabulary in ["nuscenes_default", "nuscenes_brief", "semkitti_brief"]:
+        if self.vocabulary_spec is not None:
+            if not augment_vocabulary.startswith('nuscenes') or vocabulary:
+                raise ValueError('A vocabulary manifest requires nuScenes and no extra train prompts')
+            entries = self.vocabulary_spec['entries']
+            vocabulary = [e['name'] for e in entries]
+            detailed_description = [e['prompt'] for e in entries]
+            class_reflection = [e['superclass_id'] for e in entries]
+        elif augment_vocabulary in ["nuscenes_default", "nuscenes_brief", "semkitti_brief"]:
             vocabulary, detailed_description, class_reflection = \
                 self._add_vocabulary_nuscenes(vocabulary, detailed_description, class_reflection, augment_vocabulary)
         elif augment_vocabulary == 'coco_default':
@@ -271,6 +284,9 @@ class SANInVeonEntryTemporal(nn.Module):
                class_reflection + list(range(start_class, start_class + len(append_voc)))
 
     def _merge_classes_prob(self, tensor, dim, weight):
+        if self.mode == 'nuscenes':
+            return merge_superclasses(tensor, dim, self.class_reflection,
+                                      include_background=True), weight.clone()
         dim_length = tensor.shape[dim]
         assert tensor.shape[dim] == len(self.class_reflection) + 1
         merged = []

@@ -38,8 +38,10 @@ colors_map = np.array(
 @DATASETS.register_module()
 class NuScenesDatasetRetrieval(NuScenesDataset):
 
-    def __init__(self, ret_split="val", num_adjacent=0, *args, **kwargs):
+    def __init__(self, ret_split="val", num_adjacent=0,
+                 retrieval_root='data/nuscenes/retrieval_benchmark', *args, **kwargs):
         super(NuScenesDatasetRetrieval, self).__init__(*args, **kwargs)
+        self.retrieval_root = retrieval_root
         self.num_adjacent = num_adjacent
         seqs = self.read_retrieval_split(split=ret_split)
         self.filter_sequences(seqs)
@@ -74,15 +76,15 @@ class NuScenesDatasetRetrieval(NuScenesDataset):
         return self.data_infos_adj[index]
 
     def read_retrieval_split(self, split="eval"):
-        filename = os.path.join("data/nuscenes/retrieval_benchmark", "retrieval_anns_{}.csv".format(split))
+        filename = os.path.join(self.retrieval_root, "retrieval_anns_{}.csv".format(split))
         import csv
         seqs = []
         with open(filename, newline='') as csvfile:
             spamreader = csv.reader(csvfile, delimiter=';', quotechar='|')
-            for row in spamreader:
+            for row_id, row in enumerate(spamreader):
                 token, seq_split, anno, matching_points, prompt = row
                 cur = {"token": token, "split": seq_split, "anno": anno,
-                       "matching_points": matching_points, "prompt": prompt}
+                       "matching_points": matching_points, "prompt": prompt, 'row_id': row_id}
                 seqs.append(cur)
         print("Totally {} scenes in split {}.".format(len(seqs), split))
         return seqs

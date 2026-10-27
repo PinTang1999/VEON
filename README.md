@@ -1,5 +1,12 @@
 # VEON
 
+This is a personal working copy of [VISION-SJTU/VEON](https://github.com/VISION-SJTU/VEON).
+Local changes include geometry and checkpoint fixes, vocabulary-generalization
+ablations, and environment installation helpers. The original license and
+acknowledgements are retained. See [geometry fixes](docs/en/veon_geometry_fixes.md)
+and [vocabulary generalization](docs/en/vocabulary_generalization.md) for details
+and validation limits.
+
 ## Introduction
 
 This is the official implementation of [VEON (ECCV2024)](https://arxiv.org/pdf/2407.12294).
@@ -16,6 +23,63 @@ The models learn **V**ocabulary-**E**nhanced 3D representation for Open-vocabula
 Suppose the VEON codebase path is `${VEON_HOME}`. Then, follow the subsequent procedures. 
 
 ### Step 1: Prepare Environment
+
+**One-command installer (Linux x86_64 + NVIDIA GPU)**
+
+With Conda, a working NVIDIA driver, CUDA Toolkit **10.2, 11.3 or 11.7** (including
+`nvcc`), and matching GCC/G++ already installed, run from the VEON repository:
+
+```bash
+bash tools/install_env.sh
+```
+
+The installer selects a Python 3.8 environment profile using the selected
+toolkit's `nvcc --version` (the `CUDA Version` printed by `nvidia-smi` describes
+driver capability and does not identify the installed toolkit):
+
+| Toolkit | PyTorch / torchvision | MMCV-full | MMDet / MMSeg | GCC/G++ |
+| --- | --- | --- | --- | --- |
+| 10.2 | 1.10.1 / 0.11.2 | 1.6.0 | 2.25.1 / 0.25.0 | 5–8 |
+| 11.3 | 1.10.1 / 0.11.2 | 1.6.0 | 2.25.1 / 0.25.0 | 5–10 |
+| 11.7 | 1.13.1 / 0.14.1 | 1.7.0 | 2.28.2 / 0.30.0 | 5–11 |
+
+For a server with CUDA 11.7 installed in the standard location, use a separate
+environment with:
+
+```bash
+CUDA_HOME=/usr/local/cuda-11.7 bash tools/install_env.sh veon-cu117
+```
+
+For a V100 server with CUDA Toolkit 10.2, use:
+
+```bash
+CUDA_HOME=/usr/local/cuda-10.2 bash tools/install_env.sh veon-cu102
+```
+
+The 10.2 profile requires matching GCC/G++ 5–8 and targets compute capabilities
+through 7.5, including V100 (7.0). Use the 11.x profiles for A100/RTX 3090.
+
+Adjust `CUDA_HOME` to your toolkit location. The default environment name is
+`veon`; an optional argument chooses another name. Activate the example with
+`conda activate veon-cu117`. An existing environment with a different
+PyTorch/CUDA profile is rejected to avoid mixing compiled extensions.
+
+All profiles install pinned SAN/depth dependencies and Detectron2 0.6. The
+10.2 and 11.3 profiles use their official prebuilt Detectron2 wheels; 11.7 builds
+Detectron2 from the v0.6 source tag and requires Git. The installer compiles BEVPoolv2 and
+checks model/dataset imports plus CUDA forward/backward execution.
+
+This legacy stack targets GPUs through compute capability 8.6 (e.g. V100, A100,
+RTX 3090); newer architectures require a separately adapted stack. It is not a
+macOS/CPU installer. Datasets and pretrained weights still follow Steps 1.2–4.
+Shell/Python syntax and dependency resolution for Linux x86_64 / Python 3.8
+have been checked; a full install on a CUDA server has not yet been verified.
+Package pins are in `requirements/veon-cu113.txt` (shared by 10.2 and 11.3) and
+`requirements/veon-cu117.txt`.
+
+Version references: [PyTorch previous versions](https://pytorch.org/get-started/previous-versions/),
+[Detectron2 v0.6 installation](https://github.com/facebookresearch/detectron2/blob/v0.6/INSTALL.md),
+[SAN requirements](https://github.com/MendelXu/SAN/blob/main/requirements.txt).
 
 Prepare the base environments (BEVDet & SAN & Depth). 
 

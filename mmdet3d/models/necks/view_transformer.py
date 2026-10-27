@@ -166,27 +166,34 @@ class LSSViewTransformer(BaseModule):
             interval_starts, interval_lengths = \
             self.voxel_pooling_prepare_v2(coor)
 
+        if ranks_bev is None:
+            self.ranks_bev = self.ranks_feat = self.ranks_depth = None
+            self.interval_starts = self.interval_lengths = None
+            return
         self.ranks_bev = ranks_bev.int().contiguous()
         self.ranks_feat = ranks_feat.int().contiguous()
         self.ranks_depth = ranks_depth.int().contiguous()
         self.interval_starts = interval_starts.int().contiguous()
         self.interval_lengths = interval_lengths.int().contiguous()
 
+    def _empty_bev_feature(self, depth, feat):
+        # BEVPoolv2 returns B,C,Z,Y,X before optionally collapsing Z.
+        bev_feat = feat.new_zeros((
+            feat.shape[0], feat.shape[2], int(self.grid_size[2]),
+            int(self.grid_size[1]), int(self.grid_size[0])))
+        # Retain a zero gradient path when every frustum point is out of bounds.
+        bev_feat = bev_feat + feat.reshape(-1)[:0].sum() + \
+            depth.reshape(-1)[:0].sum()
+        if self.collapse_z:
+            bev_feat = torch.cat(bev_feat.unbind(dim=2), 1)
+        return bev_feat
+
     def voxel_pooling_v2(self, coor, depth, feat):
         ranks_bev, ranks_depth, ranks_feat, \
             interval_starts, interval_lengths = \
             self.voxel_pooling_prepare_v2(coor)
         if ranks_feat is None:
-            print('warning ---> no points within the predefined '
-                  'bev receptive field')
-            dummy = torch.zeros(size=[
-                feat.shape[0], feat.shape[2],
-                int(self.grid_size[2]),
-                int(self.grid_size[0]),
-                int(self.grid_size[1])
-            ]).to(feat)
-            dummy = torch.cat(dummy.unbind(dim=2), 1)
-            return dummy
+            return self._empty_bev_feature(depth, feat)
         feat = feat.permute(0, 1, 3, 4, 2)
         bev_feat_shape = (depth.shape[0], int(self.grid_size[2]),
                           int(self.grid_size[1]), int(self.grid_size[0]),
@@ -215,28 +222,25 @@ class LSSViewTransformer(BaseModule):
         B, N, D, H, W, _ = coor.shape
         num_points = B * N * D * H * W
         # record the index of selected points for acceleration purpose
-        ranks_depth = torch.range(
-            0, num_points - 1, dtype=torch.int, device=coor.device)
-        ranks_feat = torch.range(
-            0, num_points // D - 1, dtype=torch.int, device=coor.device)
+        ranks_depth = torch.arange(
+            num_points, dtype=torch.int, device=coor.device)
+        ranks_feat = torch.arange(
+            num_points // D, dtype=torch.int, device=coor.device)
         ranks_feat = ranks_feat.reshape(B, N, 1, H, W)
         ranks_feat = ranks_feat.expand(B, N, D, H, W).flatten()
-        # convert coordinate into the voxel space
+        # Check continuous coordinates before integer conversion. A cast to long
+        # truncates (-1, 0) to zero and would admit points below the lower bound.
         coor = ((coor - self.grid_lower_bound.to(coor)) /
-                self.grid_interval.to(coor))
-        coor = coor.long().view(num_points, 3)
-        batch_idx = torch.range(0, B - 1).reshape(B, 1). \
-            expand(B, num_points // B).reshape(num_points, 1).to(coor)
-        coor = torch.cat((coor, batch_idx), 1)
-
-        # filter out points that are outside box
-        kept = (coor[:, 0] >= 0) & (coor[:, 0] < self.grid_size[0]) & \
-               (coor[:, 1] >= 0) & (coor[:, 1] < self.grid_size[1]) & \
-               (coor[:, 2] >= 0) & (coor[:, 2] < self.grid_size[2])
-        if len(kept) == 0:
+                self.grid_interval.to(coor)).reshape(num_points, 3)
+        grid_size = self.grid_size.to(coor)
+        kept = torch.isfinite(coor).all(dim=1) & \
+            ((coor >= 0) & (coor < grid_size)).all(dim=1)
+        if not kept.any():
             return None, None, None, None, None
-        coor, ranks_depth, ranks_feat = \
-            coor[kept], ranks_depth[kept], ranks_feat[kept]
+        batch_idx = torch.arange(B, device=coor.device).reshape(B, 1). \
+            expand(B, num_points // B).reshape(num_points, 1)
+        coor = torch.cat((coor[kept].long(), batch_idx[kept]), 1)
+        ranks_depth, ranks_feat = ranks_depth[kept], ranks_feat[kept]
         # get tensors from the same voxel next to each other
         ranks_bev = coor[:, 3] * (
             self.grid_size[2] * self.grid_size[1] * self.grid_size[0])
@@ -271,17 +275,20 @@ class LSSViewTransformer(BaseModule):
         # Lift-Splat
         if self.accelerate:
             feat = tran_feat.view(B, N, self.out_channels, H, W)
-            feat = feat.permute(0, 1, 3, 4, 2)
             depth = depth.view(B, N, self.D, H, W)
-            bev_feat_shape = (depth.shape[0], int(self.grid_size[2]),
-                              int(self.grid_size[1]), int(self.grid_size[0]),
-                              feat.shape[-1])  # (B, Z, Y, X, C)
-            bev_feat = bev_pool_v2(depth, feat, self.ranks_depth,
-                                   self.ranks_feat, self.ranks_bev,
-                                   bev_feat_shape, self.interval_starts,
-                                   self.interval_lengths)
-
-            bev_feat = bev_feat.squeeze(2)
+            if self.ranks_feat is None:
+                bev_feat = self._empty_bev_feature(depth, feat)
+            else:
+                feat = feat.permute(0, 1, 3, 4, 2)
+                bev_feat_shape = (depth.shape[0], int(self.grid_size[2]),
+                                  int(self.grid_size[1]), int(self.grid_size[0]),
+                                  feat.shape[-1])  # (B, Z, Y, X, C)
+                bev_feat = bev_pool_v2(depth, feat, self.ranks_depth,
+                                       self.ranks_feat, self.ranks_bev,
+                                       bev_feat_shape, self.interval_starts,
+                                       self.interval_lengths)
+                if self.collapse_z:
+                    bev_feat = torch.cat(bev_feat.unbind(dim=2), 1)
         else:
             coor = self.get_lidar_coor(*input[1:7])
             bev_feat = self.voxel_pooling_v2(

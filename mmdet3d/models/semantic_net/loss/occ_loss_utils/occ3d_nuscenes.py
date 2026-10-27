@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image
+from ...vocabulary.generalization import merge_superclasses, ORIGINAL_PRIORITY
 # from mmcv.runner import BaseModule, force_fp32
 from torch.cuda.amp import autocast
 
@@ -204,6 +205,8 @@ def BCE_BinOcc_Loss(pred, target, class_weights, ignore_index=255):
     target_bin = target.clone()
     target_bin[target < 17] = 0
     target_bin[target == 17] = 1
+    if not (target_bin != ignore_index).any():
+        return pred.sum() * 0
     criterion = nn.CrossEntropyLoss(
         weight=class_weights, ignore_index=ignore_index, reduction="mean"
     )
@@ -228,7 +231,8 @@ def CE_SemOcc_Loss(pred, target, class_weights, ignore_index=255):
 class Proj2Dto3DLoss(nn.Module):
     def __init__(self, grid_config=None, loss_det_weight=1.0, 
                  loss_soft_weight=1.0, ov_class_number=0, 
-                 high_conf_thr=0.99, stage2_start=2, priority=None):
+                 high_conf_thr=0.99, stage2_start=2, priority=None,
+                 priority_mode='original', semantic_supervision='legacy'):
         super().__init__()
         self.grid_config = grid_config
         self.loss_det_weight = loss_det_weight
@@ -239,53 +243,43 @@ class Proj2Dto3DLoss(nn.Module):
         self.epoch = 0
         self.cosine = nn.CosineSimilarity(dim=1, eps=1e-6)
         self.ov_class_number = ov_class_number
-        self.priority = torch.tensor(priority)
-        self.additional_cls_weights = torch.tensor(priority)
+        if priority_mode not in ('original', 'uniform'):
+            raise ValueError('priority_mode must be original or uniform')
+        if semantic_supervision not in ('legacy', 'occupancy_only'):
+            raise ValueError('semantic_supervision must be legacy or occupancy_only')
+        if semantic_supervision == 'occupancy_only' and ov_class_number != 17:
+            raise ValueError('occupancy_only requires all 17 superclasses open (ov_class_number=17)')
+        self.semantic_supervision = semantic_supervision
+        self.priority_mode = priority_mode
+        weights = ORIGINAL_PRIORITY if priority is None else priority
+        if len(weights) != 17 or any(not np.isfinite(x) or x <= 0 for x in weights):
+            raise ValueError('PCFA requires 17 finite positive superclass priorities')
+        weights = [1] * 17 if priority_mode == 'uniform' else weights
+        self.priority = torch.tensor(weights)
+        self.additional_cls_weights = torch.tensor(weights)
         
         print("Open-Vocabulary Class Number: {}".format(self.ov_class_number))
         print(f"Stage 2 start {self.stage2_start}, high conf thr {self.high_conf_thr}, ignore version!")
 
 
     def _merge_classes_prob(self, tensor, dim, class_reflection=None):
-        dim_length = tensor.shape[dim]
-        assert tensor.shape[dim] == len(class_reflection)
-        merged = []
-        left = 0
-        while left < dim_length:
-            right = left
-            while right < dim_length - 1 and class_reflection[left] == class_reflection[right + 1]:
-                right += 1
-            sel_indices = list(range(left, right + 1))
-            sel_indices = torch.tensor(sel_indices, device=tensor.device)
-            cur_tensor = torch.index_select(tensor, dim=dim, index=sel_indices)
-            cur_tensor = torch.max(cur_tensor, dim=dim, keepdim=True).values
-            merged.append(cur_tensor)
-            left = right + 1
-        merged_tensor = torch.cat(merged, dim=dim)
-        return merged_tensor
+        return merge_superclasses(tensor, dim, class_reflection)
 
     def _onehot_restricted_class(self, class_prob, gt_semantic, class_reflection=None):
         restricted_max_indices = torch.zeros(class_prob.shape[1], dtype=torch.long, device=gt_semantic.device)
         default_indices = torch.zeros(class_prob.shape[1], dtype=torch.long, device=gt_semantic.device)
         restricted_max_probs = torch.zeros(class_prob.shape[1], device=gt_semantic.device)
-        left = 0
-        class_id = 0
-        while left < len(class_reflection):
-            right = left
-            while right < len(class_reflection) - 1 and class_reflection[left] == class_reflection[right + 1]:
-                right += 1
-            sel_indices = list(range(left, right + 1))
+        for class_id in sorted(set(class_reflection)):
+            sel_indices = [i for i, sid in enumerate(class_reflection) if sid == class_id]
             sel_indices = torch.tensor(sel_indices, device=gt_semantic.device)
             sel_probs = torch.index_select(class_prob, dim=0, index=sel_indices)
             max_meta = torch.max(sel_probs, dim=0)
-            max_indices = max_meta.indices + left
+            max_indices = sel_indices[max_meta.indices]
             max_probs = max_meta.values
             partial_sel_idx = gt_semantic == class_id
             restricted_max_probs[partial_sel_idx] = max_probs[partial_sel_idx]
             restricted_max_indices[partial_sel_idx] = max_indices[partial_sel_idx]
             default_indices[partial_sel_idx] = class_id
-            left = right + 1
-            class_id += 1
         # merged_tensor = torch.cat(merged, dim=dim)
         return restricted_max_indices, restricted_max_probs, default_indices
 
@@ -303,15 +297,16 @@ class Proj2Dto3DLoss(nn.Module):
         # print(kept1.shape, kept1.sum(), abq.sum())
         coor = coor[kept1]
         coor_raw = coor.clone()
-        coor[:, 0] = (coor[:, 0] / ((width - 1) / 2)) - 1
-        coor[:, 1] = (coor[:, 1] / ((height - 1) / 2)) - 1
+        # Match the endpoint pixel centers used by the LSS frustum.
+        coor[:, 0] = 2 * coor[:, 0] / (width - 1) - 1 if width > 1 else 0
+        coor[:, 1] = 2 * coor[:, 1] / (height - 1) - 1 if height > 1 else 0
         coor_raw = coor_raw[:, [1, 0]]
         # coor = coor[:, [1, 0]]
         # coor = torch.rand(coor.shape, device=coor.device) * 2 - 1
 
         map_2d = map_2d[None, :]
         coor_2d = coor[None, None, :]
-        sampled_map = F.grid_sample(map_2d, coor_2d, mode='bilinear', align_corners=False)
+        sampled_map = F.grid_sample(map_2d, coor_2d, mode='bilinear', align_corners=True)
 
         return kept1, sampled_map.squeeze(2).squeeze(0), coor_raw
 
@@ -358,8 +353,12 @@ class Proj2Dto3DLoss(nn.Module):
                 sem_seg_2d_prev=None, sem_embed_2d_prev=None, 
                 class_reflection=None, ov_classifier_weight=None, class_num=18):
         # Remove free class, index 17
-        assert class_num == 18
+        if class_num != 18:
+            raise ValueError('Occ3D geometry uses 17 semantic slots and free=17; '
+                             'filter subclasses with class_reflection, not out_channel')
         class_num -= 1
+        if ov_classifier_weight.shape[0] != len(class_reflection) + 1:
+            raise ValueError('Text prototypes must match retained subclasses plus SAN background')
 
         sem_seg_2d = sem_seg_2d.detach()
         sem_embed_2d = sem_embed_2d.detach()
@@ -389,7 +388,8 @@ class Proj2Dto3DLoss(nn.Module):
         spatial_size = (imgs.shape[-2], imgs.shape[-1])
         camera_num = intrins.shape[1]
 
-        loss_det, loss_soft = 0, 0
+        # Keep empty projections differentiable; never manufacture a sample.
+        loss_det, loss_soft = pred_feat_occ.sum() * 0, pred_feat_occ.sum() * 0
         for b in range(B):
             # Calculate 2D to 3D features and class maps
             loss_cur_dets, loss_cur_softs = [], []
@@ -419,27 +419,39 @@ class Proj2Dto3DLoss(nn.Module):
                     self.sample_imgfeat_from2d(sem_seg_2d[b, cid], points_img, spatial_size, sem_valid)
                 gt_semantics = voxel_semantics_rsp[valid_lifted_3d]
                 pred_feat_occ_cur = pred_feat_occ[b][valid_lifted_3d].contiguous()
+                if pred_feat_occ_cur.shape[0] == 0:
+                    continue
 
                 # TODO: Visualize projected points
                 # self.visualize_projected_points(imgs[b, cid], coor_2d_raw, tag="proj_curr_{}_{}".format(b, cid))
 
                 class_prob_3d = torch.softmax(class_lifted_3d, dim=0)
                 class_indices_3d = torch.max(class_lifted_3d, dim=0).indices
-                restricted_max_indices, restricted_max_probs, default_indices = \
-                    self._onehot_restricted_class(class_prob_3d, gt_semantics, class_reflection)
+                if self.semantic_supervision == 'legacy':
+                    restricted_max_indices, restricted_max_probs, default_indices = \
+                        self._onehot_restricted_class(class_prob_3d, gt_semantics, class_reflection)
+                else:
+                    restricted_max_indices = class_indices_3d
                 # Stat for correct classes
                 class_map_3d_ds = self._merge_classes_prob(tensor=class_lifted_3d, dim=0,
                                                            class_reflection=class_reflection)
                 class_indices_3d_ds = torch.max(class_map_3d_ds, dim=0).indices
 
                 # ========================== Calculate Align Loss ===============================
-                sel_soft = torch.logical_or(class_indices_3d_ds == gt_semantics, gt_semantics >= (class_num - self.ov_class_number))
+                sel_soft = torch.ones_like(gt_semantics, dtype=torch.bool) \
+                    if self.semantic_supervision == 'occupancy_only' else torch.logical_or(
+                        class_indices_3d_ds == gt_semantics, gt_semantics >= (class_num - self.ov_class_number))
                 if b == B - 1 and cid == camera_num - 1 and sel_soft.shape[0] > 0:
                     sel_soft[0] = True
                 # Loss for soft classes
                 sel_det = ~sel_soft
                 if b == B - 1 and cid == camera_num - 1 and sel_det.shape[0] > 0:
                     sel_det[0] = True
+                # No deterministic prototype is available for absent groups.
+                available_gt = torch.zeros_like(sel_det)
+                for sid in set(class_reflection):
+                    available_gt |= gt_semantics == sid
+                sel_det &= available_gt
 
                 # For the lifted class
                 class_map_3d_onehot = F.one_hot(restricted_max_indices, num_classes=ov_classifier_weight.shape[0])
