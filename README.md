@@ -151,6 +151,27 @@ python tools/create_data_bevdet.py
 
 Please refer to issues of [BEVDet](https://github.com/HuangJunJie2017/BEVDet) if you are faced with any problems on nuScenes. 
 
+**Already have the BEVDet info files?** Run this read-only check from the VEON
+repository root in your VEON Python environment before deciding to regenerate:
+
+```bash
+python tools/check_nuscenes_infos.py
+```
+
+It checks both train/val pickles for the expected version, frame counts, required
+VEON fields (including `occ_path`, `scene_token`, and `ann_infos`), six cameras,
+duplicate tokens, and the existence of referenced images, point clouds, and
+`labels.npz`. Exit code `0` means these checks passed; `1` means review the reported
+issues. For an intentional subset, add `--allow-subset`. Use `--data-root /path/to/nuscenes`
+to select another pickle directory; relative paths stored inside the pickles are
+still resolved against the working directory, as in training.
+
+Passing these checks does not verify calibration values, file contents, or exact
+membership of the official splits. Incompatible info structure calls for
+regeneration; missing files call for correcting paths or completing the download.
+Back up existing pickles before regenerating, since `create_data_bevdet.py`
+overwrites them.
+
 ### Step 3: Prepare Task Materials
 
 This repository supports both Occ3D-nuScenes close-set occupancy dataset and POP-3D language-driven retrieval benchmark. 
