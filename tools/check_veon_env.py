@@ -2,12 +2,27 @@
 """Check the installed training stack without downloading data or weights."""
 import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 # Direct invocation from tools/ must resolve the current VEON checkout.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
+def check_tensorboard():
+    """Exercise the logger dependency path used by TensorboardLoggerHook."""
+    from torch.utils.tensorboard import SummaryWriter
+
+    with TemporaryDirectory(prefix='veon-tensorboard-') as log_dir:
+        with SummaryWriter(log_dir=log_dir) as writer:
+            writer.add_scalar('env_check/value', 1.0, 0)
+        if not any(path.stat().st_size > 0 for path in
+                   Path(log_dir).glob('events.out.tfevents.*')):
+            raise RuntimeError('TensorBoard did not write an event file.')
+    print('TensorBoard: SummaryWriter import and event write passed.')
+
+
 def main():
+    check_tensorboard()
     import torch
     import torchvision
     import mmcv
@@ -59,7 +74,8 @@ def main():
         print('{}: {}'.format(module.__name__, module.__version__))
     print('open_clip: {}'.format(open_clip.__file__))
     print('GPU: {}'.format(torch.cuda.get_device_name(0)))
-    print('PASS: model/dataset imports, NMS CUDA, BEVPoolv2 forward/backward.')
+    print('PASS: TensorBoard event write, model/dataset imports, NMS CUDA, '
+          'BEVPoolv2 forward/backward.')
 
 
 if __name__ == '__main__':

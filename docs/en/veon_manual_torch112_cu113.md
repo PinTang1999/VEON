@@ -101,12 +101,30 @@ python -m pip check
 python tools/check_veon_env.py
 ```
 
-自检包括模型/数据集/训练入口导入，CUDA NMS，以及 BEVPoolv2 前向和反向。
+自检包括 TensorBoard 导入和事件写入、模型/数据集/训练入口导入、CUDA NMS，
+以及 BEVPoolv2 前向和反向。
 最终应显示 `PASS`。检查通过仍不能代替真实数据上的训练验证。
 数据集和预训练权重仍按 VEON README 准备。
 
+## 训练前 TensorBoard 导入失败
+
+如果 traceback 从 `TensorboardLoggerHook.before_run` 经 `SummaryWriter`
+进入 `fsspec/caching.py`，并在 `MultiFetcher = Callable[list[[int, int]], bytes]`
+处报 `TypeError: 'type' object is not subscriptable`，说明当前 fsspec
+导入路径使用了 Python 3.8 不支持的运行时类型表达式。
+依赖清单和约束已将其固定为支持 Python 3.8 的 `2023.10.0`。
+在现有训练环境中只替换这个包，然后单独验证日志写入：
+
+```bash
+python -m pip install --no-deps --force-reinstall "fsspec==2023.10.0"
+python -c "from tools.check_veon_env import check_tensorboard; check_tensorboard()"
+```
+
+通过后重新运行训练命令。
+
 ## 官方版本依据
 
+- [fsspec 2023.10.0 的 Python 版本要求](https://pypi.org/project/fsspec/2023.10.0/)
 - [PyTorch 旧版安装组合](https://pytorch.org/get-started/previous-versions/)
 - [MMCV CUDA 11.3 / Torch 1.12 wheel 索引](https://download.openmmlab.com/mmcv/dist/cu113/torch1.12.0/index.html)
 - [MMCV 安装说明](https://mmcv.readthedocs.io/en/v1.6.0/get_started/installation.html)
