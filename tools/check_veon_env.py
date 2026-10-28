@@ -28,14 +28,15 @@ def main():
     if not torch.cuda.is_available():
         raise RuntimeError('CUDA is unavailable; check the driver and GPU allocation.')
     profiles = {
-        '10.2': ('1.10.1', '0.11.2', '1.6.0', '2.25.1', '0.25.0'),
-        '11.3': ('1.10.1', '0.11.2', '1.6.0', '2.25.1', '0.25.0'),
-        '11.7': ('1.13.1', '0.14.1', '1.7.0', '2.28.2', '0.30.0'),
+        '10.2': [('1.10.1', '0.11.2', '1.6.0', '2.25.1', '0.25.0')],
+        '11.3': [('1.10.1', '0.11.2', '1.6.0', '2.25.1', '0.25.0'),
+                 ('1.12.1', '0.13.1', '1.6.0', '2.25.1', '0.25.0')],
+        '11.7': [('1.13.1', '0.14.1', '1.7.0', '2.28.2', '0.30.0')],
     }
     actual = (torch.__version__.split('+')[0], torchvision.__version__.split('+')[0],
               mmcv.__version__, mmdet.__version__, mmseg.__version__)
-    expected = profiles.get(torch.version.cuda)
-    if actual != expected:
+    expected = profiles.get(torch.version.cuda, [])
+    if actual not in expected:
         raise RuntimeError('Unsupported package profile: CUDA={}, versions={}; expected={}'.format(
             torch.version.cuda, actual, expected))
     # Exercise compiled operators, including BEVPoolv2 forward and backward.

@@ -1,0 +1,20 @@
+# Manual installation into an existing Python 3.8 / torch 1.12.1 / CUDA 11.3 env.
+# Resolve ordinary packages from the user's configured (internal) pip mirror.
+# Keep the existing matching torchvision 0.13.1 installation.
+# MMCV and Detectron2 are installed from the accompanying local files.
+-r veon-cu113.txt
+
+# Complete dependencies for local MMCV and Detectron2 installs with --no-deps.
+addict==2.4.0
+black==21.4b2
+click==8.0.4
+cloudpickle==2.2.1
+future==0.18.3
+pydot==1.4.2
+tabulate==0.9.0
+termcolor==2.4.0
+tqdm==4.66.5
+yacs==0.1.8
+packaging==23.2
+requests==2.32.3
+typing-extensions==4.12.2

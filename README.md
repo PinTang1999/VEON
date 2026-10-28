@@ -77,6 +77,12 @@ have been checked; a full install on a CUDA server has not yet been verified.
 Package pins are in `requirements/veon-cu113.txt` (shared by 10.2 and 11.3) and
 `requirements/veon-cu117.txt`.
 
+If Python 3.8, PyTorch 1.12.1, torchvision 0.13.1 and CUDA 11.3 are already
+installed, follow the [manual installation guide](docs/en/veon_manual_torch112_cu113.md).
+It keeps the existing Torch/torchvision versions, installs ordinary dependencies
+from the configured pip mirror, and builds Detectron2 from a local source ZIP.
+The accompanying local MMCV wheel must target CUDA 11.3 / Torch 1.12 / Python 3.8.
+
 Version references: [PyTorch previous versions](https://pytorch.org/get-started/previous-versions/),
 [Detectron2 v0.6 installation](https://github.com/facebookresearch/detectron2/blob/v0.6/INSTALL.md),
 [SAN requirements](https://github.com/MendelXu/SAN/blob/main/requirements.txt).

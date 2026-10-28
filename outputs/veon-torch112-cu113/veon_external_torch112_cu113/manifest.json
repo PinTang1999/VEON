@@ -1,0 +1,14 @@
+[
+  {
+    "name": "mmcv_full-1.6.0-cp38-cp38-manylinux1_x86_64.whl",
+    "url": "https://download.openmmlab.com/mmcv/dist/cu113/torch1.12.0/mmcv_full-1.6.0-cp38-cp38-manylinux1_x86_64.whl",
+    "bytes": 40043128,
+    "sha256": "5b05ddac3d017ca3980d7b4786ce3ebef325fb3ba3fdf27cc81f7a841664834a"
+  },
+  {
+    "name": "detectron2-0.6.zip",
+    "url": "https://codeload.github.com/facebookresearch/detectron2/zip/refs/tags/v0.6",
+    "bytes": 1327955,
+    "sha256": "6bfc0ed99a9df9a7fe6cf2d1e49d1cb036384a7e5cdb87346b180ee1ea65edb8"
+  }
+]
