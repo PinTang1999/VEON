@@ -14,6 +14,7 @@ PyTorch 1.12.1 对应 torchvision 0.13.1，这两个包已经安装好，无需�
   OpenMMLab 为 1.12.x 提供的该构建用于 1.12.1。
 - Detectron2 v0.6 官方源码 ZIP，在服务器上用现有 PyTorch/CUDA 编译。
 - 普通依赖清单、版本约束和更新后的环境自检工具。
+- 原版 VEON 的模型/测试 API 循环导入修复补丁。
 
 ## 1. 解压并检查当前环境
 
@@ -21,7 +22,11 @@ PyTorch 1.12.1 对应 torchvision 0.13.1，这两个包已经安装好，无需�
 
 ```bash
 unzip -o veon-torch112-cu113-manual.zip
+git apply --reverse --check veon-import-cycle-fix.patch 2>/dev/null || git apply veon-import-cycle-fix.patch
 ```
+
+补丁只将测试 API 的模型类导入移到 `single_gpu_test()` 函数内部；已经应用
+过补丁的仓库会跳过。这使模型优先导入的环境检查可以正常完成初始化。
 
 选择实际包含 `nvcc` 的 CUDA 11.3 Toolkit。若按之前的用户目录方式安装：
 

@@ -5,9 +5,6 @@ import mmcv
 import torch
 from mmcv.image import tensor2imgs
 
-from mmdet3d.models import (Base3DDetector, Base3DSegmentor,
-                            SingleStageMono3DDetector)
-
 
 def single_gpu_test(model,
                     data_loader,
@@ -31,6 +28,11 @@ def single_gpu_test(model,
     Returns:
         list[dict]: The prediction results.
     """
+    # VEON loads the training API before model registration has completed.
+    # Resolve visualization types only when evaluation is called.
+    from mmdet3d.models import (
+        Base3DDetector, Base3DSegmentor, SingleStageMono3DDetector)
+
     model.eval()
     results = []
     dataset = data_loader.dataset
