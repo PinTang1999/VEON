@@ -256,6 +256,27 @@ For adapting the depth foundation model, you should run the following script. We
 cd ${VEON_HOME}
 bash tools/dist_train.sh configs/veon/veon-pretrain-zoedepth.py 8
 ```
+
+If training exits with only `ChildFailedError` and `error_file: <N/A>`,
+that summary does not identify the underlying worker exception. The training
+entrypoint records uncaught Python exceptions for TorchElastic. To retain each
+rank's stdout/stderr and expose data-pipeline errors in the training process, run:
+
+```bash
+DIST_LOG_DIR=work_dirs/veon-pretrain-zoedepth/debug \
+bash tools/dist_train.sh configs/veon/veon-pretrain-zoedepth.py 8 \
+    --cfg-options data.workers_per_gpu=0 log_config.interval=1
+```
+
+Inspect the first original traceback in the console, or the `stderr.log` and
+`error.json` files under the debug directory (TorchElastic creates nested run,
+attempt, and rank directories). `start use syncbn` is printed before conversion;
+by itself it does not establish whether conversion, data loading, or the first
+forward pass failed. These overrides are for diagnosis; omit them for normal
+training after fixing the reported exception. For a one-GPU reproduction, use
+the same distributed script with `1` in place of `8`; a failure specific to
+multi-GPU execution may not reproduce there.
+
 The outputting checkpoints are in folder `${VEON_HOME}/work_dirs/veon-pretrain-zoedepth/`. 
 Before starting training stage 2, you should: (1) select one checkpoint (e.g., `epoch_48.pth`); (2) place it in `${VEON_HOME}/ckpts/depth_pretrain`; and (3) rename the checkpoint as `zoedepth_pretrain.pth`. **Note:** The file names of the adapted depth models can be revised in the config files of stage 2. 
 

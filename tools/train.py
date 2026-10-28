@@ -10,6 +10,7 @@ from os import path as osp
 import mmcv
 import torch
 import torch.distributed as dist
+from torch.distributed.elastic.multiprocessing.errors import record
 from mmcv import Config, DictAction
 from mmcv.runner import get_dist_info, init_dist
 
@@ -113,6 +114,7 @@ def parse_args():
     return args
 
 
+@record
 def main():
     args = parse_args()
 
