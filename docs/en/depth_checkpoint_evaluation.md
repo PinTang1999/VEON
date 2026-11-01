@@ -100,13 +100,25 @@ The evaluator:
 - Reads that mapping, strips optional leading `module.` wrappers, extracts
   `depth_estimator.*` and loads directly into `model.depth_estimator` with
   `strict=True`. Missing, unexpected, duplicate normalized, shape and dtype
-  mismatches fail. Only `img_view_transformer.*` keys may be ignored and their
-  count is reported.
+  mismatches fail, except for the verified fixed-zero BEiT buffers described
+  below. Only `img_view_transformer.*` keys may be ignored and their count is
+  reported.
+- Separately verifies any saved
+  `core.core.pretrained.model.blocks.<index>.attn.k_bias` that is a registered
+  **nonpersistent** buffer in the runtime model. Its shape/dtype must match,
+  and both the saved tensor and runtime buffer must be finite and exactly zero.
+  Only after this audit is it excluded from the persistent-state `strict=True`
+  load; it is compared with the saved value again after `eval()`. Nonzero or
+  malformed buffers and every unrelated unexpected key still fail. Runtime
+  nonpersistent key biases must also be zero when an EMA checkpoint omits them.
 - Rejects saved floating-point parameters or buffers containing NaN/Inf before
   loading them, with the offending key and numerical summary in the error.
 - Compares **every** loaded parameter and persistent buffer against the saved
   tensor after `model.eval()`. `depth_load_verified=True` means exact equality;
-  tensor count and element count are also recorded in CSV.
+  tensor count and element count are also recorded in CSV, including the
+  separately verified nonpersistent zero buffers when present. Their count and
+  full depth-relative key list are recorded as `verified_zero_k_bias_tensors`
+  and `verified_zero_k_bias_keys`.
 - Checks epoch metadata when present. Ordinary `meta.epoch` is one-based;
   the EMA hook's top-level `epoch` is zero-based (`epoch_45_ema.pth` stores 44).
 - Disables the repository LoRA layers' in-place eval-time weight merging
@@ -185,6 +197,24 @@ marks the report incomplete and disables final recommendation, even if its
 value exceeds the dataset size. Successful smoke tests return zero, except
 GT-valid prediction blocks without finite positive support return nonzero.
 
+## Ordinary checkpoint has 24 unexpected `attn.k_bias` keys
+
+This can happen with matching training/evaluation dependencies. In
+[timm 0.6.12](https://github.com/huggingface/pytorch-image-models/blob/v0.6.12/timm/models/beit.py#L140-L143),
+BEiT registers `k_bias` as a nonpersistent zero buffer. The
+[MMCV 1.7 serializer](https://github.com/open-mmlab/mmcv/blob/v1.7.0/mmcv/runner/checkpoint.py#L625-L642)
+includes such buffers; MMCV 1.6 does the same. The ordinary runner therefore
+can save 24 additional zero tensors for the 24 BEiT-L attention blocks.
+`MEGVIIEMAHook` instead calls PyTorch's `state_dict()`, which omits them.
+
+The evaluator handles this difference through the exact-zero buffer audit above.
+It does not require `strict=False`, deleting checkpoint keys on disk, or changing
+the dependency versions. For this checkpoint layout, the CSV audit normally
+reports `verified_zero_k_bias_tensors=24` for ordinary weights and `0` for EMA.
+Both still undergo complete persistent-weight loading and post-load tensor
+verification. If a listed key bias contains a nonzero or nonfinite value, the
+evaluator rejects it rather than assuming it is disposable.
+
 ## Diagnosing NaN/Inf output
 
 The original evaluator rejected a checkpoint if **any dense output pixel** was
@@ -230,6 +260,9 @@ masking, timing boundaries, official-token coverage, report serialization and
 refusal to overwrite outputs. Numerical regressions cover isolated raw NaN,
 unscored nonfinite blocks, fully invalid predictions with retained sentinel
 penalties, nonfinite saved weights and activation-hook diagnosis/cleanup.
+Serialization regressions reproduce all 24 ordinary-only key biases, alternate
+ordinary/EMA/ordinary loads, compare outputs of the repository's actual BEiT
+attention function, and reject nonzero/malformed biases or unrelated key errors.
 They do not establish actual nuScenes MAE,
 checkpoint rankings or CUDA timings. Those require running the full command on
 the training host with the actual twelve checkpoints and dataset.

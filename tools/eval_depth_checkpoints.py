@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import sys
 import time
 import traceback
@@ -26,6 +27,7 @@ FIELDS = (
     'dataset_samples', 'full_validation', 'inference_s', 'ms_per_sample',
     'ms_per_image', 'evaluation_wall_s', 'warmup_s', 'gt_sha256',
     'depth_load_verified', 'depth_tensors', 'depth_numel',
+    'verified_zero_k_bias_tensors', 'verified_zero_k_bias_keys',
     'ignored_non_depth_tensors', 'lora_modules', 'checkpoint_epoch_raw',
     'checkpoint_updates', 'checkpoint_bytes', 'checkpoint_mtime_ns',
     'raw_pred_pixels', 'raw_pred_nonfinite_pixels',
@@ -149,6 +151,48 @@ def disable_lora_merging(depth_estimator):
     return count
 
 
+def split_beit_nonpersistent_biases(depth_estimator, depth_state):
+    """Audit the fixed buffers included by MMCV but omitted by torch.state_dict.
+
+    timm 0.6.12 registers BEiT k_bias as a nonpersistent zero buffer. MMCV
+    1.6/1.7 get_state_dict nevertheless serializes all buffers; the EMA hook
+    uses torch.state_dict and omits it. Only this exact, verified exception
+    is separated from the subsequent strict persistent-state load.
+    """
+    import torch
+
+    pattern = re.compile(r'core\.core\.pretrained\.model\.blocks\.\d+\.attn\.k_bias')
+    modules = dict(depth_estimator.named_modules())
+    verified = {}
+    for key, current in depth_estimator.named_buffers():
+        if pattern.fullmatch(key) is None:
+            continue
+        parent_name, leaf = key.rsplit('.', 1)
+        parent = modules[parent_name]
+        if leaf not in parent._non_persistent_buffers_set:
+            continue  # A persistent buffer must go through the normal strict load.
+        q_bias, v_bias = getattr(parent, 'q_bias', None), getattr(parent, 'v_bias', None)
+        if (not current.is_floating_point() or current.ndim != 1 or
+                not torch.is_tensor(q_bias) or not torch.is_tensor(v_bias) or
+                q_bias.shape != current.shape or v_bias.shape != current.shape):
+            raise ValueError('Unexpected BEiT nonpersistent k_bias schema: ' + key)
+        # Check even when the checkpoint omits k_bias (as EMA normally does),
+        # so a modified runtime buffer cannot leak into the next evaluation.
+        if not torch.isfinite(current).all().item() or torch.count_nonzero(current).item():
+            raise ValueError('Runtime BEiT nonpersistent k_bias must be fixed zero: ' + key)
+        if key not in depth_state:
+            continue
+        saved = depth_state[key]
+        if (not torch.is_tensor(saved) or saved.shape != current.shape or
+                saved.dtype != current.dtype):
+            raise ValueError('BEiT nonpersistent k_bias shape/dtype mismatch: ' + key)
+        if not torch.isfinite(saved).all().item() or torch.count_nonzero(saved).item():
+            raise ValueError('Checkpoint BEiT nonpersistent k_bias must be fixed zero: ' + key)
+        verified[key] = saved
+    persistent_state = {key: value for key, value in depth_state.items() if key not in verified}
+    return persistent_state, verified
+
+
 def load_verified_depth(model, path, epoch, weights):
     """Strictly load *only* the depth subtree, then compare EVERY saved tensor.
 
@@ -190,6 +234,7 @@ def load_verified_depth(model, path, epoch, weights):
         else:
             raise ValueError('Unexpected state_dict namespace: ' + key)
     del state
+    depth_state, zero_biases = split_beit_nonpersistent_biases(model.depth_estimator, depth_state)
     target = model.depth_estimator.state_dict()
     missing = sorted(set(target) - set(depth_state))
     unexpected = sorted(set(depth_state) - set(target))
@@ -205,12 +250,20 @@ def load_verified_depth(model, path, epoch, weights):
                              .format(key, json.dumps(tensor_summary(saved))))
     model.depth_estimator.load_state_dict(depth_state, strict=True)
     model.eval()
-    loaded = model.depth_estimator.state_dict()
-    for key, saved in depth_state.items():
+    loaded = dict(model.depth_estimator.state_dict())
+    runtime_buffers = dict(model.depth_estimator.named_buffers())
+    loaded.update({key: runtime_buffers[key] for key in zero_biases})
+    verified_state = dict(depth_state, **zero_biases)
+    for key, saved in verified_state.items():
         if not torch.equal(loaded[key].detach().cpu(), saved):
             raise RuntimeError('Post-load tensor verification failed: depth_estimator.' + key)
-    return dict(depth_load_verified=True, depth_tensors=len(depth_state),
-                depth_numel=sum(t.numel() for t in depth_state.values()),
+    if zero_biases:
+        print('  Verified {} fixed-zero nonpersistent BEiT k_bias buffers '
+              'from the checkpoint'.format(len(zero_biases)), flush=True)
+    return dict(depth_load_verified=True, depth_tensors=len(verified_state),
+                depth_numel=sum(t.numel() for t in verified_state.values()),
+                verified_zero_k_bias_tensors=len(zero_biases),
+                verified_zero_k_bias_keys=json.dumps(sorted(zero_biases)),
                 ignored_non_depth_tensors=ignored,
                 checkpoint_epoch_raw=raw_epoch if raw_epoch is not None else '',
                 checkpoint_updates=updates)
@@ -522,6 +575,9 @@ def main(argv=None):
                     token_sha256=hashlib.sha256('\n'.join(tokens).encode()).hexdigest(),
                     validation_coverage='Exact token set from official val scenes and sample.json',
                     torch_version=torch.__version__, mmcv_version=mmcv.__version__,
+                    checkpoint_compatibility='Strict persistent depth state; saved nonpersistent '
+                    'BEiT attn.k_bias buffers are accepted only after shape/dtype and '
+                    'exact-zero checks, then included in post-load equality verification.',
                     gpu=torch.cuda.get_device_name(device), batch_size=1, cameras=6,
                     precision='FP32; autocast and TF32 disabled', lora_modules=lora_modules,
                     metric='sum(abs(pred_ds - gt_ds)[gt_ds < 9225]) / sum(gt_ds < 9225)',

@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
+from typing import Optional
 import unittest
 from unittest.mock import patch
 
@@ -51,6 +52,141 @@ class DepthModel(torch.nn.Module):
         super().__init__()
         self.depth_estimator = torch.nn.Sequential(
             lora.Linear(2, 2, r=1), torch.nn.BatchNorm1d(2))
+
+
+def original_beit_attention():
+    path = ROOT / 'mmdet3d/models/depth_midas/backbones/beit.py'
+    tree = ast.parse(path.read_text())
+    function = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef) and node.name == 'attention_forward')
+    namespace = dict(torch=torch, Optional=Optional)
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])),
+                 str(path), 'exec'), namespace)
+    return namespace['attention_forward']
+
+
+class TinyBeitAttention(torch.nn.Module):
+    """timm's nonpersistent key-bias contract, with the actual VEON forward."""
+    forward = original_beit_attention()
+
+    def __init__(self):
+        super().__init__()
+        self.q_bias = torch.nn.Parameter(torch.zeros(4))
+        self.register_buffer('k_bias', torch.zeros(4), persistent=False)
+        self.v_bias = torch.nn.Parameter(torch.zeros(4))
+        self.qkv = torch.nn.Linear(4, 12, bias=False)
+        self.num_heads, self.scale = 2, 2 ** -0.5
+        self.relative_position_bias_table = None
+        self.attn_drop = torch.nn.Identity()
+        self.proj = torch.nn.Linear(4, 4)
+        self.proj_drop = torch.nn.Identity()
+
+
+class TinyBeitDepthModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.depth_estimator = torch.nn.Module()
+        parent = self.depth_estimator
+        for name in ('core', 'core', 'pretrained', 'model'):
+            child = torch.nn.Module()
+            parent.add_module(name, child)
+            parent = child
+        parent.blocks = torch.nn.ModuleList()
+        for _ in range(24):
+            block = torch.nn.Module()
+            block.attn = TinyBeitAttention()
+            parent.blocks.append(block)
+
+    @property
+    def attention(self):
+        return self.depth_estimator.core.core.pretrained.model.blocks[0].attn
+
+
+class TestBeitCheckpointSerialization(unittest.TestCase):
+    KEY = 'depth_estimator.core.core.pretrained.model.blocks.0.attn.k_bias'
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.source = TinyBeitDepthModel().eval()
+        self.target = TinyBeitDepthModel().eval()
+
+    def state(self, include_nonpersistent=True):
+        state = copy.deepcopy(self.source.state_dict())
+        # MMCV 1.6/1.7 get_state_dict includes every registered buffer, whereas
+        # the EMA hook calls torch.state_dict and excludes nonpersistent ones.
+        if include_nonpersistent:
+            state.update({name: tensor.clone() for name, tensor in self.source.named_buffers()})
+        return state
+
+    def save(self, state, kind='ordinary'):
+        checkpoint = dict(state_dict=state)
+        checkpoint.update(dict(epoch=44) if kind == 'ema' else dict(meta=dict(epoch=45)))
+        path = Path(self.temp.name) / (kind + '.pth')
+        torch.save(checkpoint, path)
+        return path
+
+    def test_mmcv_ordinary_and_torch_ema_alternate_without_changing_attention(self):
+        inputs = torch.randn(2, 5, 4)
+        ordinary_state = self.state()
+        ordinary = self.save(ordinary_state)
+        expected_ordinary = self.source.attention(inputs, (16, 16)).detach()
+        self.assertEqual(sum(name.endswith('.k_bias') for name in ordinary_state), 24)
+        self.assertNotIn(self.KEY, self.source.state_dict())
+        with torch.no_grad():
+            for parameter in self.source.parameters():
+                parameter.add_(0.05)
+        ema_state = self.state(include_nonpersistent=False)
+        ema = self.save(ema_state, 'ema')
+        expected_ema = self.source.attention(inputs, (16, 16)).detach()
+        for path, kind, expected, count in (
+                (ordinary, 'ordinary', expected_ordinary, 24),
+                (ema, 'ema', expected_ema, 0),
+                (ordinary, 'ordinary', expected_ordinary, 24)):
+            with patch('sys.stdout', new=io.StringIO()):
+                audit = evaluation.load_verified_depth(self.target, path, 45, kind)
+            self.assertTrue(audit['depth_load_verified'])
+            self.assertEqual(audit['verified_zero_k_bias_tensors'], count)
+            self.assertEqual(len(json.loads(audit['verified_zero_k_bias_keys'])), count)
+            self.assertEqual(audit['depth_tensors'], len(ema_state) + count)
+            self.assertTrue(torch.equal(self.target.attention(inputs, (16, 16)), expected))
+            self.assertNotIn(self.KEY, self.target.state_dict())
+
+    def test_nonzero_nonfinite_wrong_shape_and_wrong_dtype_biases_fail(self):
+        variants = [torch.full((4,), 1e-12), torch.full((4,), float('nan')),
+                    torch.full((4,), float('inf')), torch.zeros(3), torch.zeros(4).half()]
+        for invalid in variants:
+            state = self.state()
+            state[self.KEY] = invalid
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, 'k_bias'):
+                    evaluation.load_verified_depth(self.target, self.save(state), 45, 'ordinary')
+
+    def test_zero_bias_exception_does_not_allow_other_missing_or_extra_keys(self):
+        missing = self.state()
+        del missing[self.KEY.replace('k_bias', 'q_bias')]
+        extra = self.state()
+        extra[self.KEY.replace('k_bias', 'unrecognized_buffer')] = torch.zeros(4)
+        for state in (missing, extra):
+            with self.assertRaisesRegex(ValueError, 'key mismatch'):
+                evaluation.load_verified_depth(self.target, self.save(state), 45, 'ordinary')
+
+    def test_modified_runtime_bias_is_rejected_even_when_ema_omits_it(self):
+        self.target.attention.k_bias.fill_(1)
+        with self.assertRaisesRegex(ValueError, 'Runtime BEiT'):
+            evaluation.load_verified_depth(
+                self.target, self.save(self.state(False), 'ema'), 45, 'ema')
+
+    def test_post_load_verification_includes_nonpersistent_buffers(self):
+        original_eval = self.target.eval
+
+        def corrupt_buffer():
+            original_eval()
+            self.target.attention.k_bias.fill_(1)
+
+        with patch.object(self.target, 'eval', side_effect=corrupt_buffer):
+            with self.assertRaisesRegex(RuntimeError, 'Post-load tensor verification failed'):
+                evaluation.load_verified_depth(self.target, self.save(self.state()), 45, 'ordinary')
 
 
 class TestDepthCheckpointLoading(unittest.TestCase):
