@@ -278,6 +278,20 @@ the same distributed script with `1` in place of `8`; a failure specific to
 multi-GPU execution may not reproduce there.
 
 The outputting checkpoints are in folder `${VEON_HOME}/work_dirs/veon-pretrain-zoedepth/`. 
+To compare ordinary and EMA checkpoints from epochs 45–50 on the complete
+nuScenes validation split, run the standalone depth evaluator:
+
+```bash
+python tools/eval_depth_checkpoints.py configs/veon/veon-pretrain-zoedepth.py \
+    --checkpoint-dir work_dirs/veon-pretrain-zoedepth --workers 0
+```
+
+It writes CSV metrics and a checkpoint recommendation to a new timestamped
+directory, verifies every loaded depth tensor, and never overwrites checkpoints
+or existing report directories. See [depth checkpoint evaluation](docs/en/depth_checkpoint_evaluation.md)
+for the exact training-compatible pixel mask, weighted MAE, timing scope and
+smoke-test command.
+
 Before starting training stage 2, you should: (1) select one checkpoint (e.g., `epoch_48.pth`); (2) place it in `${VEON_HOME}/ckpts/depth_pretrain`; and (3) rename the checkpoint as `zoedepth_pretrain.pth`. **Note:** The file names of the adapted depth models can be revised in the config files of stage 2. 
 
 
