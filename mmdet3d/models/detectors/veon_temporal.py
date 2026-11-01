@@ -94,8 +94,22 @@ class VeonTemporal(Base3DDetector):
         for name, param in self.semantic_model.model.side_adapter_network.named_parameters():
             param.requires_grad = False
         if self.depth_estimator is not None:
-            for name, param in self.depth_estimator.named_parameters():
-                param.requires_grad = False
+            for module in self.depth_estimator.modules():
+                if (
+                    hasattr(module, "lora_A")
+                    and hasattr(module, "lora_B")
+                    and hasattr(module, "merge_weights")
+                ):
+                    if getattr(module, "merged", False):
+                        raise RuntimeError(
+                            "LoRA weights were merged before freezing."
+                        )
+                    module.merge_weights = False
+
+            for param in self.depth_estimator.parameters():
+                param.requires_grad_(False)
+
+            self.depth_estimator.eval()
 
     def forward_train(self,
                       points=None,

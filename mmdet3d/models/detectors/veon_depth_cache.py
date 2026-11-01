@@ -83,8 +83,26 @@ class VeonDepthCache(Base3DDetector):
         count_parameters_full(self)
 
     def _freeze_stages(self):
-        for name, param in self.depth_estimator.named_parameters():
-            param.requires_grad = False
+        # Prevent LoRA weights from being merged in-place
+        # when switching to eval mode.
+        for module in self.depth_estimator.modules():
+            if (
+                hasattr(module, "lora_A")
+                and hasattr(module, "lora_B")
+                and hasattr(module, "merge_weights")
+            ):
+                if getattr(module, "merged", False):
+                    raise RuntimeError(
+                        "LoRA weights were merged before freezing."
+                    )
+                module.merge_weights = False
+
+        # Freeze all depth parameters.
+        for param in self.depth_estimator.parameters():
+            param.requires_grad_(False)
+
+    # Keep depth predictions deterministic.
+    self.depth_estimator.eval()
 
     def forward_train(self,
                       points=None,
