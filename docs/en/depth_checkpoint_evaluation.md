@@ -13,8 +13,10 @@ python tools/eval_depth_checkpoints.py \
     --workers 0 --gpu-id 0
 ```
 
-This compares twelve files: `epoch_45.pth`, `epoch_45_ema.pth`, through
-`epoch_50.pth`, `epoch_50_ema.pth`. The training overrides
+By default this compares only six ordinary files, `epoch_45.pth` through
+`epoch_50.pth`; EMA files are neither required nor loaded. `--weights ordinary`
+makes this selection explicit. Optional `--weights both` compares both variants,
+and `--weights ema` selects EMA alone. The training overrides
 `data.workers_per_gpu=0 log_config.interval=1` do not affect the depth model or
 metric. Evaluation defaults to zero data workers; use `--log-interval 1` for
 per-sample progress.
@@ -156,7 +158,7 @@ Outputs in the new directory:
 | File | Contents |
 | --- | --- |
 | `results.csv` | One flushed row per checkpoint: epoch, ordinary/EMA, MAE in metres, error sum, valid pixels, sample/image counts, timing, load audit, GT hash, status/error and file metadata |
-| `recommendation.json` | Explicit best checkpoint, best ordinary, best EMA and ranking; or a reason why no final recommendation can be made |
+| `recommendation.json` | Best requested checkpoint and ranking, with unrequested weight groups recorded as null; or a reason why no final recommendation can be made |
 | `manifest.json` | Dataset paths, official coverage check, token hash, GPU/framework versions, metric and timing contracts |
 | `resolved_config.py` | The resolved config with the actual evaluation pipeline |
 | `epoch_<N>_<ordinary or ema>_nonfinite.json` | Created only for the first anomalous sample of each checkpoint; sample token, camera indices/names, raw/downsampled ranges and NaN/Inf counts, plus optional activation trace |
@@ -192,7 +194,7 @@ python tools/eval_depth_checkpoints.py \
     --epochs 45 --workers 0 --max-samples 2
 ```
 
-This checks both ordinary and EMA files for epoch 45. `--max-samples` always
+This checks only the ordinary file for epoch 45 by default. `--max-samples` always
 marks the report incomplete and disables final recommendation, even if its
 value exceeds the dataset size. Successful smoke tests return zero, except
 GT-valid prediction blocks without finite positive support return nonzero.
@@ -265,4 +267,5 @@ ordinary/EMA/ordinary loads, compare outputs of the repository's actual BEiT
 attention function, and reject nonzero/malformed biases or unrelated key errors.
 They do not establish actual nuScenes MAE,
 checkpoint rankings or CUDA timings. Those require running the full command on
-the training host with the actual twelve checkpoints and dataset.
+the training host with the requested checkpoints and dataset (six ordinary
+checkpoints by default).

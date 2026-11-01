@@ -507,17 +507,35 @@ class TestEvaluationPolicy(unittest.TestCase):
             writer.writerows(self.rows())
             self.assertEqual(len(list(csv.DictReader(io.StringIO(output.getvalue())))), 2)
 
-    def test_default_checkpoint_selection_requires_all_twelve_files(self):
+    def test_default_checkpoint_selection_requires_only_six_ordinary_files(self):
         args = evaluation.parse_args([])
         self.assertEqual(args.epochs, list(range(45, 51)))
+        self.assertEqual(args.weights, 'ordinary')
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
             with self.assertRaises(FileNotFoundError):
                 evaluation.checkpoint_specs(directory, args.epochs)
             for epoch in args.epochs:
-                for suffix in ('', '_ema'):
-                    (directory / 'epoch_{}{}.pth'.format(epoch, suffix)).touch()
-            self.assertEqual(len(evaluation.checkpoint_specs(directory, args.epochs)), 12)
+                (directory / 'epoch_{}.pth'.format(epoch)).touch()
+            specs = evaluation.checkpoint_specs(directory, args.epochs, args.weights)
+            self.assertEqual(len(specs), 6)
+            self.assertTrue(all(spec['weights'] == 'ordinary' for spec in specs))
+            with self.assertRaises(FileNotFoundError):
+                evaluation.checkpoint_specs(directory, args.epochs, 'both')
+            for epoch in args.epochs:
+                (directory / 'epoch_{}_ema.pth'.format(epoch)).touch()
+            self.assertEqual(len(evaluation.checkpoint_specs(directory, args.epochs, 'both')), 12)
+            self.assertEqual(len(evaluation.checkpoint_specs(directory, args.epochs, 'ema')), 6)
+
+    def test_recommendation_supports_only_requested_weight_variant(self):
+        for kind in ('ordinary', 'ema'):
+            rows = [copy.deepcopy(row) for row in self.rows() if row['weights'] == kind]
+            result = evaluation.select_recommendation(rows, 1)
+            self.assertEqual(result['status'], 'complete')
+            self.assertEqual(result['recommended']['weights'], kind)
+            self.assertEqual(result['best_' + kind], rows[0])
+            other = 'ema' if kind == 'ordinary' else 'ordinary'
+            self.assertIsNone(result['best_' + other])
 
 
 if __name__ == '__main__':

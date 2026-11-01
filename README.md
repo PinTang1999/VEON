@@ -278,7 +278,7 @@ the same distributed script with `1` in place of `8`; a failure specific to
 multi-GPU execution may not reproduce there.
 
 The outputting checkpoints are in folder `${VEON_HOME}/work_dirs/veon-pretrain-zoedepth/`. 
-To compare ordinary and EMA checkpoints from epochs 45–50 on the complete
+To compare ordinary checkpoints from epochs 45–50 on the complete
 nuScenes validation split, run the standalone depth evaluator:
 
 ```bash

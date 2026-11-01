@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare ordinary/EMA depth-pretraining checkpoints without forward_test.
+"""Compare depth-pretraining checkpoints without forward_test (ordinary by default).
 
 Run from the repository root in the training environment. See
 docs/en/depth_checkpoint_evaluation.md for the metric and timing contracts.
@@ -43,6 +43,9 @@ def parse_args(argv=None):
     parser.add_argument('--checkpoint-dir', help='Default: training work_dir')
     parser.add_argument('--epochs', nargs='+', type=int,
                         default=list(range(45, 51)))
+    parser.add_argument('--weights', choices=('ordinary', 'ema', 'both'),
+                        default='ordinary',
+                        help='Checkpoint variants to evaluate; default: ordinary only')
     parser.add_argument('--out-dir', help='Must NOT exist; default: a new '
                         'timestamped directory below checkpoint-dir')
     parser.add_argument('--ann-file', help='Override val info PKL; its tokens '
@@ -71,12 +74,14 @@ def parse_args(argv=None):
     return args
 
 
-def checkpoint_specs(directory, epochs):
+def checkpoint_specs(directory, epochs, weights='ordinary'):
+    variants = {'ordinary': (('ordinary', ''),), 'ema': (('ema', '_ema'),),
+                'both': (('ordinary', ''), ('ema', '_ema'))}[weights]
     specs = []
     for epoch in epochs:
-        for weights, suffix in (('ordinary', ''), ('ema', '_ema')):
+        for kind, suffix in variants:
             path = directory / 'epoch_{}{}.pth'.format(epoch, suffix)
-            specs.append(dict(epoch=epoch, weights=weights, checkpoint=str(path)))
+            specs.append(dict(epoch=epoch, weights=kind, checkpoint=str(path)))
     missing = [spec['checkpoint'] for spec in specs
                if not Path(spec['checkpoint']).is_file()]
     if missing:
@@ -485,9 +490,9 @@ def select_recommendation(rows, expected_count, smoke_test=False):
     ranked = sorted(rows, key=lambda row: row['mae_m'])
     return dict(status='complete', recommended=ranked[0],
                 best_ordinary=min((r for r in rows if r['weights'] == 'ordinary'),
-                                  key=lambda r: r['mae_m']),
+                                  key=lambda r: r['mae_m'], default=None),
                 best_ema=min((r for r in rows if r['weights'] == 'ema'),
-                             key=lambda r: r['mae_m']),
+                             key=lambda r: r['mae_m'], default=None),
                 ranking=[dict(checkpoint=r['checkpoint'], mae_m=r['mae_m']) for r in ranked],
                 criterion='Minimum global valid-pixel-weighted MAE (metres). '
                 'Exact ties keep requested epoch order, ordinary before EMA. '
@@ -522,7 +527,7 @@ def main(argv=None):
         raise ValueError('Use the original VeonDepthPretrain config')
     directory = Path(args.checkpoint_dir or cfg.get('work_dir') or
                      ROOT / 'work_dirs' / Path(args.config).stem).resolve()
-    specs = checkpoint_specs(directory, args.epochs)
+    specs = checkpoint_specs(directory, args.epochs, args.weights)
     torch.cuda.set_device(args.gpu_id)
     device = torch.device('cuda', args.gpu_id)
     setup_multi_processes(cfg)
