@@ -28,6 +28,9 @@ FIELDS = (
     'depth_load_verified', 'depth_tensors', 'depth_numel',
     'ignored_non_depth_tensors', 'lora_modules', 'checkpoint_epoch_raw',
     'checkpoint_updates', 'checkpoint_bytes', 'checkpoint_mtime_ns',
+    'raw_pred_pixels', 'raw_pred_nonfinite_pixels',
+    'raw_pred_nonpositive_pixels', 'gt_valid_pred_empty_pixels',
+    'first_anomaly_sample_index', 'first_anomaly_token', 'diagnostic_file',
 )
 
 
@@ -52,6 +55,10 @@ def parse_args(argv=None):
     parser.add_argument('--log-interval', type=int, default=100)
     parser.add_argument('--max-samples', type=int,
                         help='Smoke test only; disables final recommendation')
+    parser.add_argument('--diagnose-nonfinite', action='store_true',
+                        help='Rerun the first anomalous sample per checkpoint '
+                        'with module hooks to locate the first nonfinite output; '
+                        'the diagnostic rerun is excluded from inference time')
     args = parser.parse_args(argv)
     if not args.epochs or min(args.epochs) < 1 or len(set(args.epochs)) != len(args.epochs):
         parser.error('--epochs must contain distinct positive epoch numbers')
@@ -193,6 +200,9 @@ def load_verified_depth(model, path, epoch, weights):
         current = target[key]
         if not torch.is_tensor(saved) or saved.shape != current.shape or saved.dtype != current.dtype:
             raise ValueError('depth_estimator shape/dtype mismatch: ' + key)
+        if saved.is_floating_point() and not torch.isfinite(saved).all().item():
+            raise ValueError('Nonfinite checkpoint tensor depth_estimator.{}: {}'
+                             .format(key, json.dumps(tensor_summary(saved))))
     model.depth_estimator.load_state_dict(depth_state, strict=True)
     model.eval()
     loaded = model.depth_estimator.state_dict()
@@ -206,7 +216,76 @@ def load_verified_depth(model, path, epoch, weights):
                 checkpoint_updates=updates)
 
 
-def depth_error_totals(model, prediction, gt_depth):
+def tensor_summary(tensor):
+    """JSON-safe numerical diagnostics, without copying an entire activation."""
+    import torch
+
+    value = tensor.detach()
+    finite = torch.isfinite(value)
+    finite_values = value[finite]
+    return dict(shape=list(value.shape), dtype=str(value.dtype),
+                pixels=value.numel(), nonfinite=int((~finite).sum().item()),
+                nan=int(torch.isnan(value).sum().item()),
+                posinf=int((value == float('inf')).sum().item()),
+                neginf=int((value == -float('inf')).sum().item()),
+                finite_min=finite_values.min().item() if finite_values.numel() else None,
+                finite_max=finite_values.max().item() if finite_values.numel() else None,
+                first_nonfinite_indices=(~finite).nonzero()[:8].cpu().tolist())
+
+
+def _output_tensors(value, path='output'):
+    import torch
+
+    if torch.is_tensor(value):
+        yield path, value
+    elif isinstance(value, Mapping):
+        for key, child in value.items():
+            yield from _output_tensors(child, '{}.{}'.format(path, key))
+    elif isinstance(value, (tuple, list)):
+        for index, child in enumerate(value):
+            yield from _output_tensors(child, '{}[{}]'.format(path, index))
+
+
+def trace_first_nonfinite(model, depth_input, depth_size):
+    """One untimed diagnostic forward; stop at the first bad module output."""
+    import torch
+
+    class NonfiniteActivation(Exception):
+        pass
+
+    result = dict(first_nonfinite_module=None)
+    handles = []
+
+    def make_hook(name):
+        def hook(module, inputs, output):
+            for output_path, tensor in _output_tensors(output):
+                if tensor.is_floating_point() and not torch.isfinite(tensor).all().item():
+                    result.update(first_nonfinite_module=name,
+                                  module_type=type(module).__name__,
+                                  output_path=output_path, output=tensor_summary(tensor),
+                                  inputs={path: tensor_summary(value)
+                                          for path, value in _output_tensors(inputs, 'input')
+                                          if value.is_floating_point()})
+                    raise NonfiniteActivation()
+        return hook
+
+    try:
+        for name, module in model.depth_estimator.named_modules():
+            label = 'depth_estimator' + ('.' + name if name else '')
+            handles.append(module.register_forward_hook(make_hook(label)))
+        with torch.inference_mode():
+            model.estimate_depth(depth_input, depth_size)
+    except NonfiniteActivation:
+        pass
+    except Exception as error:
+        result['trace_error'] = '{}: {}'.format(type(error).__name__, error)
+    finally:
+        for handle in handles:
+            handle.remove()
+    return result
+
+
+def depth_error_totals(model, prediction, gt_depth, return_diagnostics=False):
     """Training-resolution metric: sum(error) and count, never mean-of-means."""
     import torch
 
@@ -217,20 +296,39 @@ def depth_error_totals(model, prediction, gt_depth):
         raise ValueError('Downsampled prediction/GT shapes differ: {} vs {}'
                          .format(tuple(pred.shape), tuple(target.shape)))
     valid = target < 9225  # Identical to VeonDepthPretrain.forward_train.
-    # Invalid predictions must fail the run rather than reduce its denominator.
-    if not torch.isfinite(prediction).all().item():
-        raise ValueError('Nonfinite predicted depth; no prediction-based masking is allowed')
+    # The original reducer replaces nonfinite/nonpositive raw depths with 1e5
+    # BEFORE the block minimum. Inspect the values actually used by training,
+    # rather than rejecting raw pixels which may not affect a scored tile.
+    if not torch.isfinite(pred[valid]).all().item():
+        raise ValueError('Nonfinite downsampled prediction on GT-valid pixels')
     error = (pred[valid].double() - target[valid].double()).abs().sum().item()
-    return error, int(valid.sum().item()), target
+    totals = (error, int(valid.sum().item()), target)
+    if not return_diagnostics:
+        return totals
+    finite = torch.isfinite(prediction)
+    positive = finite & (prediction > 0)
+    batch, cameras, height, width = prediction.shape
+    scale = model.pred_depth_scale
+    has_prediction = positive.reshape(
+        batch, cameras, height // scale, scale, width // scale, scale
+    ).any(dim=5).any(dim=3)
+    stats = dict(raw_pred_pixels=prediction.numel(),
+                 raw_pred_nonfinite_pixels=int((~finite).sum().item()),
+                 raw_pred_nonpositive_pixels=int((finite & ~positive).sum().item()),
+                 gt_valid_pred_empty_pixels=int((valid & ~has_prediction).sum().item()))
+    return totals + (stats,)
 
 
-def evaluate_checkpoint(model, loader, tokens, device, args):
+def evaluate_checkpoint(model, loader, tokens, device, args, diagnostic_path=None):
     import torch
 
     count = len(tokens) if args.max_samples is None else min(len(tokens), args.max_samples)
     error_sum, valid_pixels, images = 0.0, 0, 0
     inference_s, warmup_s = 0.0, 0.0
     gt_hash = hashlib.sha256()
+    numerical_totals = dict(raw_pred_pixels=0, raw_pred_nonfinite_pixels=0,
+                            raw_pred_nonpositive_pixels=0, gt_valid_pred_empty_pixels=0)
+    first_anomaly = {}
     start_wall = time.perf_counter()
     processed = 0
     with torch.inference_mode():
@@ -242,6 +340,9 @@ def evaluate_checkpoint(model, loader, tokens, device, args):
                 raise ValueError('Dataloader order/coverage mismatch at sample ' + str(index))
             depth_input = batch['depth_img_inputs'].to(device)
             gt = batch['gt_depth'].to(device)
+            if not torch.isfinite(depth_input).all().item():
+                raise ValueError('Nonfinite depth input for sample {}: {}'
+                                 .format(token, json.dumps(tensor_summary(depth_input))))
             if depth_input.ndim != 5 or depth_input.shape[:2] != (1, 6):
                 raise ValueError('Expected batch=1 and all six nuScenes cameras')
             height, width = batch['img_inputs'][0].shape[-2:]
@@ -258,7 +359,31 @@ def evaluate_checkpoint(model, loader, tokens, device, args):
             prediction = model.estimate_depth(depth_input, depth_size)['metric_depth']
             torch.cuda.synchronize(device)
             inference_s += time.perf_counter() - start
-            error, valid, target = depth_error_totals(model, prediction, gt)
+            error, valid, target, stats = depth_error_totals(
+                model, prediction, gt, return_diagnostics=True)
+            for key in numerical_totals:
+                numerical_totals[key] += stats[key]
+            if not first_anomaly and (stats['raw_pred_nonfinite_pixels'] or
+                                      stats['gt_valid_pred_empty_pixels']):
+                first_anomaly = dict(first_anomaly_sample_index=index, first_anomaly_token=token)
+                diagnostic = dict(sample_index=index, token=token, counts=stats,
+                                  depth_input=tensor_summary(depth_input),
+                                  raw_prediction=tensor_summary(prediction),
+                                  downsampled_prediction=tensor_summary(
+                                      model.img_view_transformer.downsample_depth(
+                                          prediction, model.pred_depth_scale)),
+                                  downsampled_gt=tensor_summary(target),
+                                  cameras=[dict(camera_index=i,
+                                                camera_name=getattr(args, 'camera_names', list(range(6)))[i],
+                                                prediction=tensor_summary(prediction[0, i]))
+                                           for i in range(prediction.shape[1])])
+                if getattr(args, 'diagnose_nonfinite', False):
+                    diagnostic['activation_trace'] = trace_first_nonfinite(model, depth_input, depth_size)
+                if diagnostic_path is not None:
+                    write_json_new(Path(diagnostic_path), diagnostic)
+                    first_anomaly['diagnostic_file'] = str(diagnostic_path)
+                print('  Prediction anomaly: sample={} token={} counts={} diagnostics={}'.format(
+                    index, token, stats, diagnostic_path), flush=True)
             error_sum += error
             valid_pixels += valid
             images += int(depth_input.shape[0] * depth_input.shape[1])
@@ -281,7 +406,8 @@ def evaluate_checkpoint(model, loader, tokens, device, args):
                 inference_s=inference_s, ms_per_sample=1000 * inference_s / processed,
                 ms_per_image=1000 * inference_s / images,
                 evaluation_wall_s=time.perf_counter() - start_wall,
-                warmup_s=warmup_s, gt_sha256=gt_hash.hexdigest())
+                warmup_s=warmup_s, gt_sha256=gt_hash.hexdigest(),
+                **numerical_totals, **first_anomaly)
 
 
 def select_recommendation(rows, expected_count, smoke_test=False):
@@ -298,6 +424,11 @@ def select_recommendation(rows, expected_count, smoke_test=False):
         return dict(status='incomplete', reason='GT coverage/count differs across checkpoints')
     if any(row['valid_pixels'] <= 0 or not math.isfinite(row['mae_m']) for row in rows):
         return dict(status='incomplete', reason='Invalid metric values')
+    if any(row.get('gt_valid_pred_empty_pixels', 0) for row in rows):
+        return dict(status='incomplete', reason='One or more checkpoints have GT-valid tiles '
+                    'without any finite positive prediction. Training-compatible MAE, including '
+                    'the 1e5 sentinel penalty, is preserved in CSV; inspect the per-checkpoint '
+                    'nonfinite diagnostic JSON before choosing a checkpoint.')
     ranked = sorted(rows, key=lambda row: row['mae_m'])
     return dict(status='complete', recommended=ranked[0],
                 best_ordinary=min((r for r in rows if r['weights'] == 'ordinary'),
@@ -360,6 +491,7 @@ def main(argv=None):
     if val_cfg.pipeline[0]['data_config']['Ncams'] != 6 or len(
             val_cfg.pipeline[0]['data_config']['cams']) != 6:
         raise ValueError('Validation must include all six cameras')
+    args.camera_names = list(val_cfg.pipeline[0]['data_config']['cams'])
     dataset = build_dataset(val_cfg)
     if dataset.version != 'v1.0-trainval':
         raise ValueError('Full validation requires nuScenes v1.0-trainval')
@@ -393,6 +525,10 @@ def main(argv=None):
                     gpu=torch.cuda.get_device_name(device), batch_size=1, cameras=6,
                     precision='FP32; autocast and TF32 disabled', lora_modules=lora_modules,
                     metric='sum(abs(pred_ds - gt_ds)[gt_ds < 9225]) / sum(gt_ds < 9225)',
+                    nonfinite_policy='Use the unchanged training reducer (raw nonfinite/nonpositive '
+                    'depths become 1e5 before block minimum); never remove GT-valid pixels. '
+                    'Count anomalies and withhold recommendation if a GT-valid tile has '
+                    'no finite positive raw prediction.',
                     prediction_downsample=model.pred_depth_scale,
                     gt_downsample=model.gt_depth_scale,
                     timing='CUDA-synchronized estimate_depth() including output resize; '
@@ -413,7 +549,10 @@ def main(argv=None):
                 stat = Path(spec['checkpoint']).stat()
                 row.update(checkpoint_bytes=stat.st_size, checkpoint_mtime_ns=stat.st_mtime_ns)
                 row.update(load_verified_depth(model, spec['checkpoint'], spec['epoch'], spec['weights']))
-                row.update(evaluate_checkpoint(model, loader, tokens, device, args))
+                row.update(evaluate_checkpoint(
+                    model, loader, tokens, device, args,
+                    diagnostic_path=out / 'epoch_{}_{}_nonfinite.json'.format(
+                        spec['epoch'], spec['weights'])))
                 after = Path(spec['checkpoint']).stat()
                 if (after.st_size, after.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
                     raise RuntimeError('Checkpoint changed during evaluation')
@@ -435,7 +574,8 @@ def main(argv=None):
         print('No checkpoint was copied, renamed or overwritten.')
         return 0
     print('NO FINAL RECOMMENDATION: ' + summary['reason'])
-    return 1 if any(row['status'] != 'ok' for row in rows) or args.max_samples is None else 0
+    return 1 if any(row['status'] != 'ok' or row.get('gt_valid_pred_empty_pixels', 0)
+                    for row in rows) or args.max_samples is None else 0
 
 
 if __name__ == '__main__':

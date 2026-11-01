@@ -81,7 +81,16 @@ the evaluator does not substitute that mask. `valid_pixels` counts valid
 Errors are summed in float64 across all cameras and samples. This is a global
 pixel-weighted MAE, unlike the training log's running mean of batch means.
 There is no per-image scaling, median alignment, prediction clipping or
-prediction-dependent pixel removal. Nonfinite predictions fail the checkpoint.
+prediction-dependent pixel removal.
+
+Raw NaN/Inf pixels are handled by the **existing training reducer**: it replaces
+them (and nonpositive depths) with `1e5` before taking a block minimum. A raw
+nonfinite pixel therefore does not necessarily affect a scored pixel. The
+evaluator checks finiteness of the downsampled prediction on the GT-valid mask,
+and reports raw anomalies separately. It never removes a GT-valid pixel because
+its prediction is invalid. If an entire prediction block lacks any finite
+positive value, its existing `1e5` sentinel penalty is included in MAE, and the
+checkpoint comparison receives no final recommendation pending diagnosis.
 
 ## Checkpoint loading audit
 
@@ -93,6 +102,8 @@ The evaluator:
   `strict=True`. Missing, unexpected, duplicate normalized, shape and dtype
   mismatches fail. Only `img_view_transformer.*` keys may be ignored and their
   count is reported.
+- Rejects saved floating-point parameters or buffers containing NaN/Inf before
+  loading them, with the offending key and numerical summary in the error.
 - Compares **every** loaded parameter and persistent buffer against the saved
   tensor after `model.eval()`. `depth_load_verified=True` means exact equality;
   tensor count and element count are also recorded in CSV.
@@ -125,8 +136,8 @@ data loading/preprocessing, host-to-device transfer, warmup, GT/prediction
 downsampling, metric aggregation and checkpoint loading/verification.
 `ms_per_sample` is per six-camera sample; `ms_per_image` divides that by six.
 This is single-GPU evaluation latency, with explicit unmerged LoRA computation.
-`evaluation_wall_s` separately includes loading, transfers, warmup, inference and
-metrics, but excludes checkpoint loading/verification.
+`evaluation_wall_s` separately includes loading, transfers, warmup, inference,
+metrics and optional diagnostics, but excludes checkpoint loading/verification.
 
 Outputs in the new directory:
 
@@ -136,6 +147,18 @@ Outputs in the new directory:
 | `recommendation.json` | Explicit best checkpoint, best ordinary, best EMA and ranking; or a reason why no final recommendation can be made |
 | `manifest.json` | Dataset paths, official coverage check, token hash, GPU/framework versions, metric and timing contracts |
 | `resolved_config.py` | The resolved config with the actual evaluation pipeline |
+| `epoch_<N>_<ordinary or ema>_nonfinite.json` | Created only for the first anomalous sample of each checkpoint; sample token, camera indices/names, raw/downsampled ranges and NaN/Inf counts, plus optional activation trace |
+
+CSV numerical diagnostic columns:
+
+- `raw_pred_pixels`: total dense predicted pixels before downsampling.
+- `raw_pred_nonfinite_pixels`: raw NaN/Inf count.
+- `raw_pred_nonpositive_pixels`: finite raw depths less than or equal to zero.
+- `gt_valid_pred_empty_pixels`: GT-valid downsampled pixels whose prediction
+  blocks contain **no finite positive raw prediction**. Their sentinel error
+  stays in MAE; a nonzero count disables final recommendation.
+- `first_anomaly_sample_index`, `first_anomaly_token`, `diagnostic_file`: locate
+  the first numerical anomaly without dumping image data or full tensors.
 
 The recommendation is the lowest global MAE among **all requested checkpoints**.
 An exact tie keeps requested epoch order, ordinary before EMA. It is a depth
@@ -145,6 +168,9 @@ have identical sample/image counts, valid-pixel counts and downsampled GT
 hashes. An evaluation failure produces a CSV error row, allows the other
 checkpoints to run, disables final recommendation and returns a nonzero exit
 code. Missing checkpoint files fail preflight before output creation.
+Raw nonfinite pixels alone do not disable recommendation when every GT-valid
+prediction block has finite positive support under the unchanged training
+reducer. Read the numerical columns when interpreting such a recommendation.
 
 For a quick server smoke test (a **new** output directory is still required):
 
@@ -156,7 +182,38 @@ python tools/eval_depth_checkpoints.py \
 
 This checks both ordinary and EMA files for epoch 45. `--max-samples` always
 marks the report incomplete and disables final recommendation, even if its
-value exceeds the dataset size. Successful smoke tests return zero.
+value exceeds the dataset size. Successful smoke tests return zero, except
+GT-valid prediction blocks without finite positive support return nonzero.
+
+## Diagnosing NaN/Inf output
+
+The original evaluator rejected a checkpoint if **any dense output pixel** was
+nonfinite. That was stricter than the actual training reduction and could reject
+a run even when its scored downsampled pixels were valid. The updated evaluator
+preserves the training computation and emits numerical diagnostics instead.
+A traceback at the old raw-output check alone does not show whether the weights,
+an activation, or only unscored dense pixels were affected.
+
+After updating the script on the training host, first run a small diagnostic
+comparison (use a known failing epoch with `--epochs` if desired):
+
+```bash
+python tools/eval_depth_checkpoints.py \
+    --workers 0 --max-samples 2 --warmup 0 --diagnose-nonfinite
+```
+
+`--diagnose-nonfinite` reruns the first anomalous sample per checkpoint with
+forward hooks on the depth estimator's modules. It records the first module
+returning NaN/Inf, its type, input/output finite ranges and counts, and removes
+all temporary hooks afterwards. This rerun does not contribute to inference
+time or MAE. Hooks identify a module boundary, not necessarily the individual
+functional operation inside it. If the anomaly does not reproduce, the trace
+records no nonfinite module. No model state or prediction is repaired.
+
+If the error only occurs after the first two samples, omit `--max-samples 2`
+and let the diagnostic run reach the affected sample. For full comparison, run
+the original full command without `--max-samples` (and restore warmup by omitting
+`--warmup 0`). Each invocation still creates a fresh report directory.
 
 ## Local verification boundary
 
@@ -170,6 +227,9 @@ original `estimate_depth()` and `downsample_depth()` methods extracted without
 the MMCV/CUDA import stack. They cover strict full-subtree loading, sequential
 ordinary/EMA state replacement, LoRA stability, weighted aggregation, sentinel
 masking, timing boundaries, official-token coverage, report serialization and
-refusal to overwrite outputs. They do not establish actual nuScenes MAE,
+refusal to overwrite outputs. Numerical regressions cover isolated raw NaN,
+unscored nonfinite blocks, fully invalid predictions with retained sentinel
+penalties, nonfinite saved weights and activation-hook diagnosis/cleanup.
+They do not establish actual nuScenes MAE,
 checkpoint rankings or CUDA timings. Those require running the full command on
 the training host with the actual twelve checkpoints and dataset.

@@ -126,6 +126,14 @@ class TestDepthCheckpointLoading(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'Post-load'):
                 evaluation.load_verified_depth(self.model, path, 45, 'ordinary')
 
+    def test_nonfinite_checkpoint_tensor_is_rejected_before_loading(self):
+        for nonfinite in (float('nan'), float('inf'), -float('inf')):
+            state = copy.deepcopy(self.model.state_dict())
+            state['depth_estimator.0.weight'][0, 0] = nonfinite
+            with self.subTest(value=nonfinite):
+                with self.assertRaisesRegex(ValueError, 'Nonfinite checkpoint tensor depth_estimator.0.weight'):
+                    evaluation.load_verified_depth(self.model, self.save(state=state), 45, 'ordinary')
+
     def test_lora_explicit_forward_matches_single_merge_and_stays_stable(self):
         torch.manual_seed(3)
         explicit = lora.Linear(2, 2, r=1)
@@ -213,11 +221,74 @@ class TestDepthEvaluationMetrics(unittest.TestCase):
         self.assertAlmostEqual(error, 2 + float(gt[0, 0, 0, 16]) - 3)
         self.assertEqual(target[0, 0, 1, 1].item(), 1e5)
 
-    def test_nonfinite_prediction_does_not_silently_reduce_valid_count(self):
+    def test_nonfinite_raw_pixel_keeps_training_reduction_and_gt_denominator(self):
         prediction = torch.full((1, 1, 16, 16), 2.)
         prediction[0, 0, 0, 0] = float('nan')
-        with self.assertRaisesRegex(ValueError, 'Nonfinite'):
-            evaluation.depth_error_totals(MetricModel(), prediction, torch.ones(1, 1, 32, 32))
+        error, count, target, stats = evaluation.depth_error_totals(
+            MetricModel(), prediction, torch.ones(1, 1, 32, 32), return_diagnostics=True)
+        self.assertEqual(count, 4)
+        self.assertEqual(error, 4)
+        self.assertEqual(stats['raw_pred_nonfinite_pixels'], 1)
+        self.assertEqual(stats['gt_valid_pred_empty_pixels'], 0)
+
+    def test_nonfinite_unscored_tile_does_not_reject_valid_scored_tile(self):
+        prediction = torch.full((1, 1, 16, 16), 2.)
+        prediction[0, 0, :8, :8] = float('inf')
+        gt = torch.zeros(1, 1, 32, 32)
+        gt[0, 0, 16, 16] = 1
+        error, count, _, stats = evaluation.depth_error_totals(
+            MetricModel(), prediction, gt, return_diagnostics=True)
+        self.assertEqual((error, count), (1, 1))
+        self.assertEqual(stats['raw_pred_nonfinite_pixels'], 64)
+        self.assertEqual(stats['gt_valid_pred_empty_pixels'], 0)
+
+    def test_fully_invalid_prediction_keeps_sentinel_penalty_and_gt_count(self):
+        prediction = torch.full((1, 1, 16, 16), float('nan'))
+        error, count, _, stats = evaluation.depth_error_totals(
+            MetricModel(), prediction, torch.ones(1, 1, 32, 32), return_diagnostics=True)
+        self.assertEqual(count, 4)
+        self.assertEqual(error, (1e5 - 1) * count)
+        self.assertEqual(stats['raw_pred_nonfinite_pixels'], prediction.numel())
+        self.assertEqual(stats['gt_valid_pred_empty_pixels'], count)
+
+    def test_first_anomaly_diagnostic_preserves_metrics_and_reports_sample(self):
+        class NanOutput(EchoEstimator):
+            def forward(self, inputs):
+                output = super().forward(inputs)
+                output['metric_depth'] = output['metric_depth'].clone()
+                output['metric_depth'][0, 0, 0, 0] = float('nan')
+                return output
+
+        batch = self.batch('a', 12., [(0, 0)])
+        model = MetricModel()
+        model.depth_estimator = NanOutput()
+        args = SimpleNamespace(max_samples=None, warmup=0, log_interval=100,
+                               diagnose_nonfinite=False)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'diagnostic.json'
+            with patch('torch.cuda.synchronize'), patch('sys.stdout', new=io.StringIO()):
+                result = evaluation.evaluate_checkpoint(
+                    model, [batch], ['a'], 'cpu', args, diagnostic_path=path)
+            self.assertEqual(result['mae_m'], 2)
+            self.assertEqual(result['valid_pixels'], 6)
+            self.assertEqual(result['first_anomaly_token'], 'a')
+            report = json.loads(path.read_text())
+            self.assertEqual(report['raw_prediction']['nan'], 1)
+            self.assertEqual(report['counts']['gt_valid_pred_empty_pixels'], 0)
+            self.assertEqual(len(report['cameras']), 6)
+
+    def test_nonfinite_activation_trace_identifies_first_module_and_removes_hooks(self):
+        class DivideByZero(torch.nn.Module):
+            def forward(self, inputs):
+                return inputs / 0.
+
+        model = MetricModel()
+        model.depth_estimator = torch.nn.Sequential(torch.nn.Identity(), DivideByZero())
+        result = evaluation.trace_first_nonfinite(model, torch.ones(1, 6, 3, 16, 16), (16, 16))
+        self.assertEqual(result['first_nonfinite_module'], 'depth_estimator.1')
+        self.assertEqual(result['module_type'], 'DivideByZero')
+        self.assertGreater(result['output']['posinf'], 0)
+        self.assertTrue(all(not module._forward_hooks for module in model.depth_estimator.modules()))
 
     def test_smoke_run_cannot_report_full_validation(self):
         args = SimpleNamespace(max_samples=1, warmup=0, log_interval=100)
@@ -274,11 +345,15 @@ class TestEvaluationPolicy(unittest.TestCase):
         self.assertEqual(evaluation.select_recommendation(rows, 2, True)['status'], 'incomplete')
         for field, value in [('status', 'error'), ('full_validation', False),
                              ('depth_load_verified', False), ('gt_sha256', 'other'),
-                             ('valid_pixels', 23), ('mae_m', float('nan'))]:
+                             ('valid_pixels', 23), ('mae_m', float('nan')),
+                             ('gt_valid_pred_empty_pixels', 1)]:
             bad = copy.deepcopy(rows)
             bad[1][field] = value
             with self.subTest(field=field):
                 self.assertEqual(evaluation.select_recommendation(bad, 2)['status'], 'incomplete')
+        rows[1]['raw_pred_nonfinite_pixels'] = 1
+        rows[1]['gt_valid_pred_empty_pixels'] = 0
+        self.assertEqual(evaluation.select_recommendation(rows, 2)['status'], 'complete')
 
     def test_csv_and_json_schema_and_existing_outputs(self):
         with tempfile.TemporaryDirectory() as temp:
