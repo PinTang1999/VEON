@@ -113,6 +113,7 @@ data/nuscenes/*
 .idea
 
 # custom
+.bucket_sync/
 *.pkl
 *.pkl.json
 *.log.json

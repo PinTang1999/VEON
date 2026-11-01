@@ -7,6 +7,11 @@ acknowledgements are retained. See [geometry fixes](docs/en/veon_geometry_fixes.
 and [vocabulary generalization](docs/en/vocabulary_generalization.md) for details
 and validation limits.
 
+For one-command uploads of code, `ckpts/`, and training outputs to the intranet
+bucket (excluding `data/`), run `bash sync_bucket.sh` with your existing
+`upload_folder.py`. See the [bucket sync guide](docs/en/bucket_sync.md) for setup,
+incremental uploads, previews, and training-side downloads.
+
 ## Introduction
 
 This is the official implementation of [VEON (ECCV2024)](https://arxiv.org/pdf/2407.12294).

@@ -101,8 +101,8 @@ class VeonDepthCache(Base3DDetector):
         for param in self.depth_estimator.parameters():
             param.requires_grad_(False)
 
-    # Keep depth predictions deterministic.
-    self.depth_estimator.eval()
+        # Keep depth predictions deterministic.
+        self.depth_estimator.eval()
 
     def forward_train(self,
                       points=None,
