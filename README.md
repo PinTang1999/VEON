@@ -11,6 +11,9 @@ For one-command uploads of code, `ckpts/`, and training outputs to the intranet
 bucket (excluding `data/`), run `bash sync_bucket.sh` with your existing
 `upload_folder.py`. See the [bucket sync guide](docs/en/bucket_sync.md) for setup,
 incremental uploads, previews, and training-side downloads.
+After cloning on a new machine and preparing the environment/data, run
+`bash download_bucket.sh` to restore only checkpoints and experiment outputs.
+Use `--paths ckpts work_dirs/EXPERIMENT` to select a smaller restore.
 
 ## Introduction
 

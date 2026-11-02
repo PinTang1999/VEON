@@ -286,7 +286,7 @@ def make_batches(files, current, limit):
     return batches
 
 
-def run_uploader(command, root, interval):
+def run_uploader(command, root, interval, label='上传'):
     # Python 上传工具（包括 moxing）的输出不要被子进程自身的缓冲隐藏。
     env = dict(os.environ, PYTHONUNBUFFERED='1')
     started = time.monotonic()
@@ -296,9 +296,9 @@ def run_uploader(command, root, interval):
                 try:
                     return process.wait(timeout=interval)
                 except subprocess.TimeoutExpired:
-                    print('[上传] 已等待 {:.0f} 秒，上传工具仍在运行（PID {}）；'
+                    print('[{}] 已等待 {:.0f} 秒，传输工具仍在运行（PID {}）；'
                           '请留意其网络/认证输出。'.format(
-                              time.monotonic() - started, process.pid),
+                              label, time.monotonic() - started, process.pid),
                           flush=True)
         except BaseException:
             # 先结束子进程再清理其正在读取的暂存文件，避免中断时无限等待。

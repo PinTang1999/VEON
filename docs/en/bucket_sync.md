@@ -116,15 +116,76 @@ bash sync_bucket.sh
 
 ## 在训练环境下载
 
-在训练环境的 VEON 根目录，继续使用你已有的下载命令：
+在新机器上 `git clone` 本仓库、准备 Python 环境并下载数据后，
+激活可以使用 `moxing` 的环境，从 VEON 根目录执行：
 
 ```bash
-python /path/to/upload_folder.py s3://bucket-6425/tangpin/code/VEON/ ./
+bash download_bucket.sh
 ```
 
-数据集仍由训练环境本地的 `data/` 提供。上传脚本不会新增桶内的 `data/` 对象；如果该
-前缀原来就存有数据，整前缀下载仍会获取那些旧对象，应选择干净的代码前缀。
+脚本默认只访问 `s3://bucket-6425/tangpin/code/VEON/` 下的以下目录：
+
+| 桶中的子目录 | 本地目录 | 用途 |
+| --- | --- | --- |
+| `ckpts/` | `ckpts/` | SAN、深度模型和预训练权重 |
+| `outputs/` | `outputs/` | 输出、离线安装包等 |
+| `output/` | `output/` | 使用单数目录名保存的输出 |
+| `work_dirs/` | `work_dirs/` | 实验检查点、日志、词表划分等 |
+| `exps/` | `exps/` | 其他实验输出 |
+
+不会整前缀下载，不访问桶中的根级代码或 `data/`、`datasets/`，因此保留 Git 拉下来的
+代码和已经下载好的数据。权重按原始相对路径恢复，例如
+`ckpts/clipsan/SAN_ViT-L.pth`，无需为了换机器修改该路径。
+
+默认要求桶中有 `ckpts/`。桶中没有 `output/` 等可选输出目录时会显示跳过。
+如果只需要做新实验的预训练权重，或只想拿回某次实验，指定目录即可，避免全量下载：
+
+```bash
+# 只恢复预训练权重
+bash download_bucket.sh --paths ckpts
+
+# 权重 + 指定的实验输出
+bash download_bucket.sh --paths ckpts work_dirs/ijcv_l_t2
+
+# 权重 + outputs（保留其他历史实验在桶里）
+bash download_bucket.sh --paths ckpts outputs
+
+# 不联网、不写入，只预览来源与目标路径
+bash download_bucket.sh --dry-run
+```
+
+`--paths` 只接受上表中的目录及其子目录，禁止代码、数据目录和越界路径。
+显式选择的目录若不存在会返回失败。同一父目录和子目录重复选择时只下载一次。
+工具需要放在项目根目录；如果位于其他位置或依赖其他 Python 环境，可以指定：
+
+```bash
+bash download_bucket.sh --uploader /path/to/upload_folder.py
+bash download_bucket.sh --python /path/to/python
+bash download_bucket.sh --remote s3://bucket-6425/tangpin/code/VEON/
+```
+
+下载脚本与上传脚本共用 `VEON_UPLOAD_SCRIPT`、`VEON_BUCKET_URL`、
+`VEON_SYNC_PYTHON` 环境变量，也可以运行 `python tools/download_bucket.py`。
+它复用 `tools/sync_bucket.py` 中的工具查找和进程管理；两份 Python 文件都应来自当前仓库。
+
+脚本先在所选 Python 中通过 `mox.file.exists`、`mox.file.is_directory` 检查远端目录，
+再逐目录调用原有的 `upload_folder.py`。这些检查接口见
+[MoXing 官方示例](https://support.huaweicloud.com/intl/en-us/devtool-modelarts/modelarts_11_0005.html)。
+检查或传输长时间没有输出时，每 5 秒显示等待时间，可用 `--progress-interval 2` 调整。
+
+文件直接下载到对应本地目录，不再额外暂存全部权重；磁盘仍需有容纳最终文件的空间。
+同名文件由现有工具覆盖，本地多余文件保留，不做删除。为避免通过本地链接写入代码
+或数据，下载目标及其内部若已有符号链接，脚本会停止并列出该链接。
+
+某目录下载失败时会保留已下载文件、继续其他目录，最后返回非零退出码并打印失败项的
+重试命令。重新执行会再次调用选中目录的下载，是否省略相同文件由现有工具决定，
+不保证文件级增量或字节级断点续传。没有额外的远端哈希验证。
+
+下载完成后，按原有训练命令指定配置开始实验。脚本只恢复桶里已有的文件，不会自动
+启动训练或改变配置中的 `load_from` / `resume_from`；原上传时未成功同步的文件及被跳过
+的符号链接（如某些 `latest.pth`）也不会凭空恢复，需要选择实际存在的检查点文件。
 
 当前 `upload_folder.py` 使用 `mox.file.copy_parallel(src, dst)`。
-已用替代上传工具验证目录结构、增量上传、变化文件跳过、分批失败重试和进度输出，
+已用替代上传工具及离线 MoXing 接口验证上传/下载目录结构、代码和数据保留、
+增量上传、变化文件跳过、分批失败重试和进度输出，
 尚未连接内网数据桶验证真实传输。
