@@ -27,13 +27,16 @@ if os.environ.get('SYNC_TEST_DELAY'):
 source, remote = Path(sys.argv[1]), sys.argv[2]
 files = sorted(p.relative_to(source).as_posix()
                for p in source.rglob('*') if p.is_file())
+log_path = Path(os.environ['SYNC_TEST_LOG'])
+call_number = len(log_path.read_text().splitlines()) + 1 if log_path.exists() else 1
 with open(os.environ['SYNC_TEST_LOG'], 'a') as stream:
     stream.write(json.dumps({'remote': remote, 'files': files}) + '\\n')
 for index, key in enumerate(files):
     target = Path(os.environ['SYNC_TEST_BUCKET']) / key
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(str(source / key), str(target))
-    if index == 0 and os.environ.get('SYNC_TEST_FAIL'):
+    if index == 0 and (os.environ.get('SYNC_TEST_FAIL') or str(call_number)
+                      == os.environ.get('SYNC_TEST_FAIL_ON_CALL')):
         sys.exit(7)
 '''
 
@@ -57,6 +60,22 @@ class TestBucketSync(unittest.TestCase):
         self.env.pop('VEON_UPLOAD_SCRIPT', None)
         self.env.pop('SYNC_TEST_FAIL', None)
         self.env.pop('SYNC_TEST_DELAY', None)
+        self.env.pop('SYNC_TEST_FAIL_ON_CALL', None)
+
+    def load_module(self):
+        spec = importlib.util.spec_from_file_location('bucket_sync', SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def run_in_process(self, module, *args):
+        output = io.StringIO()
+        argv = [str(SCRIPT), '--root', str(self.root),
+                '--uploader', str(self.uploader)] + list(args)
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(
+                sys, 'argv', argv), contextlib.redirect_stdout(output):
+            self.assertEqual(module.main(), 0)
+        return output.getvalue()
 
     def write(self, key, content='fixture'):
         path = self.root / key
@@ -211,11 +230,11 @@ class TestBucketSync(unittest.TestCase):
         def slow_scan(*args):
             # Inspect stdout at scan entry, before any hashing can finish.
             self.assertIn('[1/3] 开始扫描', output.getvalue())
-            return {}, [], []
+            return {}, [], [], {}
 
         args = module.argparse.Namespace(
             dry_run=True, exclude=[], full=False, verbose=False,
-            progress_interval=5)
+            progress_interval=5, batch_size_mib=4096)
         with contextlib.redirect_stdout(output), mock.patch.object(
                 module, 'scan', side_effect=slow_scan):
             module.sync(args, self.root, 's3://test/VEON/',
@@ -235,11 +254,147 @@ class TestBucketSync(unittest.TestCase):
         self.write('ckpts/large.pth', 'x' * (3 * 1024 ** 2))
         # An almost-zero interval makes chunk progress deterministic and fast.
         result = self.run_sync('--progress-interval', '0.000001')
-        self.assertIn('计算哈希 ckpts/large.pth：', result.stdout)
         self.assertIn('[暂存]', result.stdout)
         self.assertIn('3.0/3.0 MiB (100%)', result.stdout)
         self.assertEqual((self.bucket / 'ckpts/large.pth').stat().st_size,
                          3 * 1024 ** 2)
+        self.write('ckpts/large.pth', 'y' * (3 * 1024 ** 2))
+        result = self.run_sync('--progress-interval', '0.000001')
+        self.assertIn('计算哈希 ckpts/large.pth：', result.stdout)
+
+    def test_active_log_changed_after_scan_keeps_old_state_and_retries(self):
+        key = 'work_dirs/run/train.log'
+        self.write('configs/a.py', 'old code')
+        log = self.write(key, 'old log')
+        self.run_sync()
+        state_path = next((self.root / '.bucket_sync').glob('*.json'))
+        old_entry = json.loads(state_path.read_text())['files'][key]
+        self.write('configs/a.py', 'new code')
+        log.write_text('log before scan')
+        module = self.load_module()
+        original = module.stage_files
+
+        def change_log(*args):
+            with log.open('a') as stream:
+                stream.write('\ntraining is still running')
+            return original(*args)
+
+        with mock.patch.object(module, 'stage_files', side_effect=change_log):
+            output = self.run_in_process(module)
+        self.assertIn('[跳过] ' + key, output)
+        self.assertEqual(self.calls()[-1]['files'], ['configs/a.py'])
+        self.assertEqual((self.bucket / key).read_text(), 'old log')
+        self.assertEqual(json.loads(state_path.read_text())['files'][key], old_entry)
+        self.run_sync()
+        self.assertEqual(self.calls()[-1]['files'], [key])
+        self.assertEqual((self.bucket / key).read_text(), log.read_text())
+
+    def test_file_changed_during_staging_is_not_uploaded_or_acknowledged(self):
+        self.write('configs/a.py')
+        key = 'work_dirs/run/latest.pth'
+        checkpoint = self.write(key, 'not yet finished')
+        module = self.load_module()
+        original = module.copy_and_digest
+
+        def change_checkpoint(source, target, size, progress):
+            checksum = original(source, target, size, progress)
+            if source.resolve() == checkpoint.resolve():
+                source.write_text('still writing the checkpoint')
+            return checksum
+
+        with mock.patch.object(module, 'copy_and_digest',
+                               side_effect=change_checkpoint):
+            output = self.run_in_process(module)
+        self.assertIn('[跳过] ' + key, output)
+        self.assertEqual(self.calls()[0]['files'], ['configs/a.py'])
+        state_path = next((self.root / '.bucket_sync').glob('*.json'))
+        self.assertNotIn(key, json.loads(state_path.read_text())['files'])
+        self.run_sync()
+        self.assertEqual(self.calls()[-1]['files'], [key])
+
+    def test_file_changed_during_hashing_does_not_abort_other_files(self):
+        key = 'work_dirs/run/train.log'
+        self.write('configs/a.py', 'old code')
+        log = self.write(key, 'old log')
+        self.run_sync()
+        self.write('configs/a.py', 'new code')
+        log.write_text('before hash')
+        module = self.load_module()
+        original = module.digest
+
+        def change_log(path, progress=None, size=None):
+            checksum = original(path, progress, size)
+            if path.resolve() == log.resolve():
+                with path.open('a') as stream:
+                    stream.write('\nnew line')
+            return checksum
+
+        with mock.patch.object(module, 'digest', side_effect=change_log):
+            output = self.run_in_process(module)
+        self.assertIn('[跳过] ' + key, output)
+        self.assertEqual(self.calls()[-1]['files'], ['configs/a.py'])
+        self.assertEqual((self.bucket / key).read_text(), 'old log')
+
+    def test_first_scan_defers_hashing_new_checkpoint_until_snapshot(self):
+        self.write('ckpts/large.pth', 'checkpoint bytes')
+        module = self.load_module()
+        with mock.patch.object(module, 'digest', side_effect=AssertionError(
+                'new files must not be fully read during metadata scan')):
+            current, changed, links, deferred = module.scan(
+                self.root, {}, [], module.Progress('scan', 5))
+        self.assertEqual(changed, ['ckpts/large.pth'])
+        self.assertIsNone(current['ckpts/large.pth']['sha256'])
+        self.assertFalse(links or deferred)
+
+    def test_successful_batches_remain_acknowledged_after_later_failure(self):
+        for key in ('configs/a.py', 'configs/b.py', 'ckpts/c.pth'):
+            self.write(key, '1234')
+        # 5-byte batches put each 4-byte file into its own upload call.
+        limit = ('--batch-size-mib', '0.000005')
+        env = dict(self.env, SYNC_TEST_FAIL_ON_CALL='2')
+        self.run_sync(*limit, expected=1, env=env)
+        self.assertEqual([call['files'] for call in self.calls()],
+                         [['configs/a.py'], ['configs/b.py']])
+        state_path = next((self.root / '.bucket_sync').glob('*.json'))
+        self.assertEqual(list(json.loads(state_path.read_text())['files']),
+                         ['configs/a.py'])
+        self.run_sync(*limit)
+        self.assertEqual([call['files'] for call in self.calls()][2:],
+                         [['configs/b.py'], ['ckpts/c.pth']])
+
+    def test_only_active_files_skip_uploader_and_are_not_acknowledged(self):
+        log = self.write('work_dirs/run/train.log', 'before scan')
+        module = self.load_module()
+        original = module.stage_files
+
+        def change_log(*args):
+            log.write_text('after scan, still writing')
+            return original(*args)
+
+        with mock.patch.object(module, 'stage_files', side_effect=change_log):
+            output = self.run_in_process(module)
+        self.assertIn('跳过 1 个变化文件', output)
+        self.assertFalse(self.calls())
+        state_path = next((self.root / '.bucket_sync').glob('*.json'))
+        self.assertEqual(json.loads(state_path.read_text())['files'], {})
+
+    def test_snapshot_copy_is_bounded_even_when_source_keeps_growing(self):
+        original_content = 'a' * (2 * 1024 ** 2)
+        source = self.write('work_dirs/run/train.log', original_content)
+        target = self.root.parent / 'snapshot.log'
+        module = self.load_module()
+        callbacks = []
+
+        def append_more(done):
+            callbacks.append(done)
+            with source.open('a') as stream:
+                stream.write('additional log line')
+
+        checksum = module.copy_and_digest(
+            source, target, len(original_content), append_more)
+        self.assertEqual(target.read_text(), original_content)
+        self.assertEqual(checksum, module.digest(target))
+        self.assertEqual(len(callbacks), 2)
 
 
 if __name__ == '__main__':
