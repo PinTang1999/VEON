@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -34,6 +35,27 @@ EXCLUDED_FILES = (
 ROOT_ARCHIVES = ('*.zip', '*.tar', '*.tar.gz', '*.tgz', '*.whl', '*.7z')
 
 
+class Progress:
+    """节流打印进度，重定向输出时也立即可见。"""
+
+    def __init__(self, label, interval):
+        self.label = label
+        self.interval = interval
+        self.last = time.monotonic()
+
+    def update(self, message, force=False):
+        now = time.monotonic()
+        if force or now - self.last >= self.interval:
+            print('[{}] {}'.format(self.label, message), flush=True)
+            self.last = now
+
+
+def byte_progress(done, total):
+    return '{:.1f}/{:.1f} MiB ({:.0f}%)'.format(
+        done / 1024 ** 2, total / 1024 ** 2,
+        100 * done / total if total else 100)
+
+
 def excluded(relative, is_dir, extra):
     parts = relative.parts
     name = parts[-1]
@@ -51,11 +73,29 @@ def excluded(relative, is_dir, extra):
     return any(fnmatch.fnmatchcase(path, p.rstrip('/')) for p in extra)
 
 
-def digest(path):
+def digest(path, progress=None):
     result = hashlib.sha256()
+    done = 0
     with path.open('rb') as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b''):
             result.update(block)
+            done += len(block)
+            if progress:
+                progress(done)
+    return result.hexdigest()
+
+
+def copy_and_digest(source, target, progress):
+    """边复制边校验，避免暂存后再完整读取一次大权重。"""
+    result = hashlib.sha256()
+    done = 0
+    with source.open('rb') as reader, target.open('wb') as writer:
+        for block in iter(lambda: reader.read(1024 * 1024), b''):
+            writer.write(block)
+            result.update(block)
+            done += len(block)
+            progress(done)
+    shutil.copystat(str(source), str(target))
     return result.hexdigest()
 
 
@@ -65,7 +105,7 @@ def signature(path):
             'ctime_ns': stat.st_ctime_ns}
 
 
-def scan(root, previous, extra):
+def scan(root, previous, extra, progress):
     """不读取 data/；不跟随任何符号链接，以免绕过目录排除规则。"""
     current, changed, skipped_links = {}, [], []
 
@@ -74,6 +114,8 @@ def scan(root, previous, extra):
 
     for directory, dirs, files in os.walk(root, onerror=walk_error):
         base = Path(directory)
+        progress.update('已检查 {} 个文件；目录 {}'.format(
+            len(current), base.relative_to(root).as_posix()))
         kept = []
         for name in sorted(dirs):
             path = base / name
@@ -96,13 +138,21 @@ def scan(root, previous, extra):
                 continue
             if not path.is_file():
                 continue
+            progress.update('已检查 {} 个文件；检查 {}'.format(len(current), key))
             entry = signature(path)
             old = previous.get(key, {})
             if (all(old.get(k) == v for k, v in entry.items())
                     and old.get('sha256')):
                 entry['sha256'] = old['sha256']
             else:
-                entry['sha256'] = digest(path)
+                def hash_progress(done):
+                    progress.update('已检查 {} 个文件；计算哈希 {}：{}'.format(
+                        len(current), key, byte_progress(done, entry['size'])))
+
+                progress.update('计算哈希 {}：{}'.format(
+                    key, byte_progress(0, entry['size'])),
+                    force=entry['size'] >= 64 * 1024 ** 2)
+                entry['sha256'] = digest(path, hash_progress)
                 if signature(path) != {k: entry[k] for k in SIGNATURE_KEYS}:
                     raise RuntimeError('扫描时文件发生变化，请稍后重试: ' + key)
             current[key] = entry
@@ -148,17 +198,56 @@ def find_uploader(value, root):
                        '或使用 --uploader /path/to/upload_folder.py。')
 
 
-def stage_files(root, staging, files, current):
-    for key in files:
+def stage_files(root, staging, files, current, progress):
+    total = sum(current[key]['size'] for key in files)
+    completed = 0
+    for index, key in enumerate(files, 1):
         source, target = root / key, staging / key
         expected = {k: current[key][k] for k in SIGNATURE_KEYS}
         if source.is_symlink() or signature(source) != expected:
             raise RuntimeError('文件在扫描后发生变化，请重试: ' + key)
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(source), str(target))
+
+        def copy_progress(done):
+            progress.update('{}/{} 个文件；{}；总计 {}'.format(
+                index, len(files), key, byte_progress(completed + done, total)))
+
+        progress.update('{}/{} 个文件；{}；总计 {}'.format(
+            index, len(files), key, byte_progress(completed, total)),
+            force=expected['size'] >= 64 * 1024 ** 2)
+        copied_digest = copy_and_digest(source, target, copy_progress)
         if (signature(source) != expected
-                or digest(target) != current[key]['sha256']):
+                or copied_digest != current[key]['sha256']):
             raise RuntimeError('文件在暂存时发生变化，请重试: ' + key)
+        completed += expected['size']
+    progress.update('{} 个文件；总计 {}'.format(
+        len(files), byte_progress(completed, total)), force=True)
+
+
+def run_uploader(command, root, interval):
+    # Python 上传工具（包括 moxing）的输出不要被子进程自身的缓冲隐藏。
+    env = dict(os.environ, PYTHONUNBUFFERED='1')
+    started = time.monotonic()
+    with subprocess.Popen(command, cwd=str(root), env=env) as process:
+        try:
+            while True:
+                try:
+                    return process.wait(timeout=interval)
+                except subprocess.TimeoutExpired:
+                    print('[上传] 已等待 {:.0f} 秒，上传工具仍在运行（PID {}）；'
+                          '请留意其网络/认证输出。'.format(
+                              time.monotonic() - started, process.pid),
+                          flush=True)
+        except BaseException:
+            # 先结束子进程再清理其正在读取的暂存文件，避免中断时无限等待。
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            raise
 
 
 def print_plan(remote, current, selected, removed, links, verbose):
@@ -181,8 +270,12 @@ def print_plan(remote, current, selected, removed, links, verbose):
 
 
 def sync(args, root, remote, state_path):
+    uploader = None if args.dry_run else find_uploader(args.uploader, root)
     previous = load_state(state_path, remote)
-    current, changed, links = scan(root, previous, args.exclude)
+    print('[1/3] 开始扫描: {}'.format(root), flush=True)
+    print('首次同步会读取权重和输出文件计算哈希，大文件需要一些时间。', flush=True)
+    current, changed, links = scan(
+        root, previous, args.exclude, Progress('扫描', args.progress_interval))
     selected = sorted(current) if args.full else sorted(changed)
     removed = previous.keys() - current.keys()
     print_plan(remote, current, selected, removed, links, args.verbose)
@@ -194,21 +287,22 @@ def sync(args, root, remote, state_path):
         print('没有需要上传的变更。')
         return 0
 
-    uploader = find_uploader(args.uploader, root)
     # uploader 只需支持上传整个文件夹，无需支持 exclude 或单文件上传。
     # 暂存目录保留项目相对路径，且仅包含本次需要上传的文件。
     with tempfile.TemporaryDirectory(prefix='veon-bucket-sync-') as temporary:
         staging = Path(temporary) / root.name
         staging.mkdir()
-        print('正在暂存待上传文件（需约 {:.2f} MiB 临时空间）...'.format(
+        print('[2/3] 正在暂存待上传文件（需约 {:.2f} MiB 临时空间）...'.format(
             sum(current[p]['size'] for p in selected) / 1024 ** 2), flush=True)
-        stage_files(root, staging, selected, current)
+        stage_files(root, staging, selected, current,
+                    Progress('暂存', args.progress_interval))
         command = [args.python, str(uploader), str(staging) + os.sep, remote]
-        print('执行: ' + ' '.join(shlex.quote(p) for p in command), flush=True)
-        result = subprocess.run(command, cwd=str(root))
-        if result.returncode:
+        print('[3/3] 开始上传: ' + ' '.join(shlex.quote(p) for p in command),
+              flush=True)
+        returncode = run_uploader(command, root, args.progress_interval)
+        if returncode:
             raise RuntimeError('上传工具失败（退出码 {}），未更新同步记录；'
-                               '下次执行会重试。'.format(result.returncode))
+                               '下次执行会重试。'.format(returncode))
     save_state(state_path, remote, current)
     print('上传完成，同步记录已更新。')
     return 0
@@ -230,7 +324,11 @@ def main():
     parser.add_argument('--exclude', action='append', default=[], metavar='PATH_OR_GLOB',
                         help='额外排除项目相对路径或 glob，可重复指定')
     parser.add_argument('--verbose', action='store_true', help='显示全部文件路径')
+    parser.add_argument('--progress-interval', type=float, default=5,
+                        help='进度和上传等待提示的间隔秒数，默认 5')
     args = parser.parse_args()
+    if not 0 < args.progress_interval < float('inf'):
+        parser.error('--progress-interval 必须为有限正数')
     root = args.root.expanduser().resolve()
     if not root.is_dir():
         parser.error('--root 必须是已存在的目录')

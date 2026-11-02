@@ -1,4 +1,7 @@
 """Exercise the directory-only uploader contract without network or ML deps."""
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -6,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[2] / 'tools' / 'sync_bucket.py'
@@ -14,8 +18,12 @@ import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
+if os.environ.get('SYNC_TEST_DELAY'):
+    print('helper started')  # Deliberately no flush: parent must disable buffering.
+    time.sleep(float(os.environ['SYNC_TEST_DELAY']))
 source, remote = Path(sys.argv[1]), sys.argv[2]
 files = sorted(p.relative_to(source).as_posix()
                for p in source.rglob('*') if p.is_file())
@@ -48,6 +56,7 @@ class TestBucketSync(unittest.TestCase):
         self.env.pop('VEON_BUCKET_URL', None)
         self.env.pop('VEON_UPLOAD_SCRIPT', None)
         self.env.pop('SYNC_TEST_FAIL', None)
+        self.env.pop('SYNC_TEST_DELAY', None)
 
     def write(self, key, content='fixture'):
         path = self.root / key
@@ -192,6 +201,45 @@ class TestBucketSync(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.calls()[0]['files'],
                          ['configs/a.py', 'upload_folder.py'])
+
+    def test_scan_announces_itself_before_reading_files(self):
+        spec = importlib.util.spec_from_file_location('bucket_sync', SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        output = io.StringIO()
+
+        def slow_scan(*args):
+            # Inspect stdout at scan entry, before any hashing can finish.
+            self.assertIn('[1/3] 开始扫描', output.getvalue())
+            return {}, [], []
+
+        args = module.argparse.Namespace(
+            dry_run=True, exclude=[], full=False, verbose=False,
+            progress_interval=5)
+        with contextlib.redirect_stdout(output), mock.patch.object(
+                module, 'scan', side_effect=slow_scan):
+            module.sync(args, self.root, 's3://test/VEON/',
+                        self.root / '.bucket_sync/test.json')
+
+    def test_waiting_uploader_reports_status_and_flushes_child_output(self):
+        self.write('configs/a.py')
+        env = dict(self.env, SYNC_TEST_DELAY='0.4')
+        result = self.run_sync('--progress-interval', '0.1', env=env)
+        self.assertIn('[2/3] 正在暂存', result.stdout)
+        self.assertIn('[3/3] 开始上传', result.stdout)
+        self.assertIn('[上传] 已等待', result.stdout)
+        self.assertLess(result.stdout.index('helper started'),
+                        result.stdout.index('[上传] 已等待'))
+
+    def test_large_file_progress_tracks_hashing_and_staging_bytes(self):
+        self.write('ckpts/large.pth', 'x' * (3 * 1024 ** 2))
+        # An almost-zero interval makes chunk progress deterministic and fast.
+        result = self.run_sync('--progress-interval', '0.000001')
+        self.assertIn('计算哈希 ckpts/large.pth：', result.stdout)
+        self.assertIn('[暂存]', result.stdout)
+        self.assertIn('3.0/3.0 MiB (100%)', result.stdout)
+        self.assertEqual((self.bucket / 'ckpts/large.pth').stat().st_size,
+                         3 * 1024 ** 2)
 
 
 if __name__ == '__main__':
