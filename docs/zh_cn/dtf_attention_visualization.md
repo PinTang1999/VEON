@@ -17,7 +17,7 @@ bash tools/run_dtf_visualization.sh export --sample-index 1 --verify-output
 
 Smoke test 成功时会打印 `Verified identical occupancy labels` 以及 NPZ 路径。默认输出为 `work_dirs/dtf_visualization/sample_000001.npz`（索引 1）。导出前会校验两个分支的张量形状、概率和及采样坐标范围。`--verify-output` 比较 VEON 最终返回的逐体素类别 ID。
 
-默认 config 为 `configs/veon/veon-temporal-large-512x1408-zoe-withdepthcache-T2.py`。在 `work_dirs/ijcv_l_t2_true/` 中优先使用有效的 `latest.pth`，其次按数字取最大的普通 `epoch_N.pth`。目录中仅有 EMA 系列时按数字取最大的 EMA epoch。如果只有一个其他名称的 PTH，则使用该文件。也可以用 `--checkpoint FILE.pth` 明确指定普通或 EMA 权重。NPZ 保存解析后的 checkpoint 路径和配置路径。不同实验建议分别指定 `--out-dir`，同一目录内相同索引会更新同名 NPZ。
+默认 config 为 `configs/veon/veon-temporal-large-512x1408-zoe-withdepthcache-T2.py`。`run` 和 `export` 默认加载第 10 个 epoch 的普通权重 `work_dirs/ijcv_l_t2_true/epoch_10.pth`。如需切换权重，可传入 `--checkpoint FILE.pth`。NPZ 保存解析后的 checkpoint 路径和配置路径。不同实验建议分别指定 `--out-dir`，同一目录内相同索引会更新同名 NPZ。
 
 默认选择第一个具有独立历史帧的测试样本。若数据集的历史帧全部为重复帧，则使用索引 0。使用 `--sample-index` 或 `--sample-token` 可以复现具体样本。当 pipeline 在场景边界重用当前帧充当历史帧时，图中会标明。使用 `--gpu-id` 选择当前可见 GPU 的序号。
 

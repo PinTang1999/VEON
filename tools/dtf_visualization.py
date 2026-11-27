@@ -7,7 +7,7 @@ import re
 from tempfile import TemporaryDirectory
 
 DEFAULT_CONFIG = 'configs/veon/veon-temporal-large-512x1408-zoe-withdepthcache-T2.py'
-DEFAULT_CHECKPOINT = 'work_dirs/ijcv_l_t2_true'
+DEFAULT_CHECKPOINT = 'work_dirs/ijcv_l_t2_true/epoch_10.pth'
 DEFAULT_OUT = 'work_dirs/dtf_visualization'
 DTF_PATH = 'semantic_model.model.occ_decoder.temporal_fusion.deform_fusion_layer.t_deform'
 
@@ -21,7 +21,7 @@ def parse_args(argv=None):
     for command in (run, export):
         command.add_argument('--config', type=Path, default=Path(DEFAULT_CONFIG))
         command.add_argument('--checkpoint', type=Path, default=Path(DEFAULT_CHECKPOINT),
-                             help='checkpoint file or training directory')
+                             help='checkpoint file or training directory (default: %(default)s)')
         samples = command.add_mutually_exclusive_group()
         samples.add_argument('--sample-index', type=int, help='zero-based test dataset index')
         samples.add_argument('--sample-token', help='nuScenes keyframe token')
