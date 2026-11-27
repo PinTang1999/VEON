@@ -17,9 +17,9 @@ DTF_PATH = 'semantic_model.model.occ_decoder.temporal_fusion.deform_fusion_layer
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_subparsers(dest='mode', required=True)
-    run = modes.add_parser('run', help='export one sample and render PDF and PNG')
-    export = modes.add_parser('export', help='export one sample to NPZ on the GPU server')
-    plot = modes.add_parser('plot', help='render an existing NPZ with NumPy and Matplotlib')
+    run = modes.add_parser('run', help='export samples and render figures')
+    export = modes.add_parser('export', help='export sample archives on the GPU server')
+    plot = modes.add_parser('plot', help='render sample archives with NumPy and Matplotlib')
     for command in (run, export):
         command.add_argument('--config', type=Path, default=Path(DEFAULT_CONFIG))
         command.add_argument('--checkpoint', type=Path, default=Path(DEFAULT_CHECKPOINT),
@@ -112,11 +112,15 @@ def select_sample(dataset, index, token):
             raise ValueError(f'Unknown sample token {token}')
     if index is None:
         # The test pipeline repeats the current frame at scene boundaries.
+        index, best_count = 0, 1
         for i, info in enumerate(dataset.data_infos):
             history = dataset.get_adj_info(info, i)
-            if history and all(adj['token'] != info['token'] for adj in history):
+            tokens = [info['token']] + [adj['token'] for adj in history]
+            distinct = len(set(tokens))
+            if history and distinct == len(tokens):
                 return i
-        index = 0
+            if distinct > best_count:
+                index, best_count = i, distinct
     if not 0 <= index < len(dataset):
         raise ValueError(f'Sample index {index} outside dataset of length {len(dataset)}')
     return index
@@ -380,14 +384,17 @@ def export_acc_predictions(args, paths):
     for path in paths:
         with np.load(path, allow_pickle=False) as sample:
             token = str(sample['sample_token'])
-            if (not np.allclose(bounds[:, 0], sample['origin_xyz'])
-                    or not np.allclose(bounds[:, 2], sample['fine_voxel_size_xyz'])):
-                raise ValueError('ACC and DTF grid origins or cell sizes differ')
+            native_shape = sample['prediction_zyx'].shape[::-1]
+            if (not np.allclose(bounds[:, 0], sample['origin_xyz'], rtol=0, atol=1e-6)
+                    or not np.allclose(bounds[:, 2], sample['fine_voxel_size_xyz'], rtol=0, atol=1e-6)
+                    or not np.allclose(bounds[:, 1] - bounds[:, 0], bounds[:, 2] * native_shape)):
+                raise ValueError('ACC and DTF grid origins, cell sizes or extents differ')
+        if token not in by_token:
+            raise ValueError(f'ACC dataset has no corresponding sample token {token}')
         batch = collate([dataset[by_token[token]]], samples_per_gpu=1)
         with torch.no_grad():
             labels = np.asarray(model(return_loss=False, rescale=True, **batch)[0])
-        if (labels.dtype.kind not in 'iu' or labels.ndim != 3
-                or not np.allclose(bounds[:, 1]-bounds[:, 0], bounds[:, 2]*labels.shape)
+        if (labels.dtype.kind not in 'iu' or labels.shape != native_shape
                 or not np.isin(labels, list(range(18)) + [255]).all()):
             raise ValueError('Expected an ACC Occ3D-nuScenes class-ID grid in XYZ order')
         with TemporaryDirectory(dir=directory) as staging:

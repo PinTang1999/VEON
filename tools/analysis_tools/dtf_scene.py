@@ -136,19 +136,21 @@ def choose_queries(data, context, args):
         return [(tuple(map(int, xyz)), 'manual metric' if args.metric_query else 'manual voxel')]
 
     key = {'prediction': 'prediction_zyx', 'gt': 'gt_zyx'}[args.selection_source]
-    if key not in data:
-        raise ValueError(f'Missing {key} for the requested selection source')
-    labels = at_queries(data[key], shape)
+    native = data[key]
+    labels = at_queries(native, shape)
     allowed = [CLASSES.index(c) for c in args.classes] if args.classes else range(FREE)
     mask = np.isin(labels, list(allowed))
     movable = np.isin(labels, MOVABLE)
-    boundary = np.zeros(labels.shape, bool)
+    # Evaluate faces at native resolution before sampling them at query centres.
+    # Thin occupied/free transitions can lie between neighbouring DTF centres.
+    native_boundary = np.zeros(native.shape, dtype=bool)
     for axis in range(3):
-        view = np.moveaxis(labels, axis, 0)
-        edges = np.moveaxis(boundary, axis, 0)
+        view = np.moveaxis(native, axis, 0)
+        edges = np.moveaxis(native_boundary, axis, 0)
         change = (view[:-1] != view[1:]) & (view[:-1] != UNKNOWN) & (view[1:] != UNKNOWN)
         edges[:-1] |= change
         edges[1:] |= change
+    boundary = at_queries(native_boundary, shape)
     if args.strategy == 'boundary':
         mask &= boundary
     elif args.strategy == 'dynamic':

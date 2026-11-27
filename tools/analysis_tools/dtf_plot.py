@@ -4,6 +4,12 @@ import numpy as np
 BRANCHES = ('current', 'history')
 
 
+def branch_label(data, branch):
+    if branch == 'history' and len(data['history_tokens']) > 1:
+        return 'Recursive history query'
+    return branch.capitalize() + ' query'
+
+
 def validate_archive(data):
     required = {'schema_version', 'sample_index', 'sample_token', 'history_tokens',
                 'scene_token', 'config', 'checkpoint', 'depth_checkpoint',
@@ -133,8 +139,13 @@ def semantic_image(ax, data, image, plane, fine=True):
               interpolation='nearest', aspect='equal', zorder=0)
 
 
-def draw_boundary(ax, segments):
+def draw_boundary(ax, segments, center=None, radius=None):
     from matplotlib.collections import LineCollection
+    if radius is not None:
+        # Keep long scene-wide paths out of local vector PDFs.
+        keep = ((segments.min(axis=1) <= center + radius)
+                & (segments.max(axis=1) >= center - radius)).all(axis=1)
+        segments = segments[keep]
     if len(segments):
         from matplotlib import patheffects
         lines = LineCollection(segments, **BOUNDARY, zorder=2)
@@ -168,7 +179,7 @@ def set_view(ax, dims, center, radius=None):
 
 def figure_key(ax, pooled=False):
     from matplotlib.lines import Line2D
-    name = 'Predicted occupancy boundary' + (' (pooled)' if pooled else '')
+    name = 'Predicted occupancy boundary' + (' (pooled)' if pooled else ' (DTF)')
     handles = [Line2D([], [], **BOUNDARY, label=name),
                Line2D([], [], **CONNECTION, label='Sampling connections'),
                Line2D([], [], marker='x', lw=0, color=QUERY['color'], label='Query voxel'),
@@ -210,14 +221,14 @@ def diagnostic_figure(data, stem, heads, xyz, radius, dpi):
         ax.imshow(peak, origin='lower', extent=extent, interpolation='nearest', cmap='magma', vmin=0, vmax=1)
         draw_boundary(ax, sections['XY'][1])
         draw_query(ax, center, (0, 1))
-        ax.set_title(branch.capitalize()+' query · peak weight')
+        ax.set_title(branch_label(data, branch) + ' · peak weight')
         set_view(ax, (0, 1), center)
         points, weights = sample_points(data, branch, heads, xyz)
         for j, (plane, dims) in enumerate(PLANES.items(), 1):
             ax = fig.add_subplot(layout[i, j])
             labels, segments = sections[plane]
             semantic_image(ax, data, labels, plane, fine='prediction_zyx' in data)
-            draw_boundary(ax, segments)
+            draw_boundary(ax, segments, center[list(dims)], radius)
             draw_sampling(ax, points, weights, center, dims)
             set_view(ax, dims, center, radius)
             if i == 0:
@@ -228,7 +239,8 @@ def diagnostic_figure(data, stem, heads, xyz, radius, dpi):
                      orientation='horizontal', label=name)
     figure_key(fig.add_subplot(layout[3, :]), pooled='prediction_zyx' not in data)
     head = str(heads[0]) if len(heads)==1 else 'aggregate'
-    repeated = str(data['sample_token']) in data['history_tokens']
+    tokens = [str(data['sample_token']), *data['history_tokens']]
+    repeated = len(set(tokens)) != len(tokens)
     fig.suptitle(f"Sample {int(data['sample_index'])} · head {head} · query ({x}, {y}, {z})"
                  + (' · repeated history frame' if repeated else ''))
     return save_figure(fig, stem, dpi)

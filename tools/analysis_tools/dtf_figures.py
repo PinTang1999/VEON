@@ -4,7 +4,7 @@ import json
 import numpy as np
 
 from .dtf_diagnostics import summarize
-from .dtf_plot import (BRANCHES, diagnostic_figure, draw_boundary, draw_query, draw_sampling,
+from .dtf_plot import (BRANCHES, branch_label, diagnostic_figure, draw_boundary, draw_query, draw_sampling,
                        figure_key, sample_points, save_figure, select_query, semantic_image,
                        set_view, validate_archive)
 from .dtf_scene import (CLASSES, UNKNOWN, attention_mass, choose_queries, fine_indices,
@@ -26,7 +26,8 @@ def context_image(data, context, xyz, history=None):
     prefix = f'history_{history}_'
     lag = int(data['sample_index']) - int(data['history_indices'][history])
     suffix = f' (t−{lag})'
-    if data['history_tokens'][history] == data['sample_token']:
+    previous_tokens = [str(data['sample_token']), *data['history_tokens'][:history]]
+    if data['history_tokens'][history] in previous_tokens:
         suffix += ' · repeated'
     for key, label in [('prediction', 'Aligned prediction'), ('gt', 'Aligned GT')]:
         if prefix+key in context:
@@ -136,6 +137,28 @@ def query_masses(data, heads, xyz):
     return points, probs, masses
 
 
+def point_record(data, context, points, weights):
+    """Look up semantic context at each 3D endpoint before projection."""
+    indices = np.floor((points - data['origin_xyz']) / data['fine_voxel_size_xyz']).astype(int)
+    x, y, z = indices.transpose(2, 0, 1)
+    index = (z, y, x)
+    result = dict(metric_xyz=points.tolist(), weights=weights.tolist(),
+                  fine_voxel_xyz=indices.tolist(),
+                  dtf_class_id=data['prediction_zyx'][index].tolist())
+    for field in ('gt_zyx', 'visible_zyx'):
+        if field in data:
+            result[field] = data[field][index].tolist()
+    for name in ('current_only', 'acc'):
+        if name in context:
+            result[name + '_class_id'] = context[name]['labels'][index].tolist()
+    for i in range(len(data['history_tokens'])):
+        for field in ('gt', 'visible', 'prediction'):
+            key = f'history_{i}_{field}'
+            if key in context:
+                result[key] = context[key][index].tolist()
+    return result
+
+
 def mass_overlay(ax, mass, data, vmax):
     spacing = data['fine_voxel_size_xyz']
     lo = data['origin_xyz']
@@ -157,11 +180,11 @@ def attention_figure(data, xyz, masses, radius, path, dpi):
             ax = fig.add_subplot(layout[row,col])
             semantic_image(ax,data,labels,'XY')
             overlay = mass_overlay(ax,masses[branch],data,vmax)
-            draw_boundary(ax,edges)
+            draw_boundary(ax, edges, center[:2], half)
             draw_query(ax,center,(0,1))
             set_view(ax,(0,1),center,half)
             if row==0:
-                ax.set_title(branch.capitalize()+' query · fused K/V')
+                ax.set_title(branch_label(data, branch) + ' · fused K/V')
     fig.colorbar(overlay,cax=fig.add_subplot(layout[2,:]),orientation='horizontal',
                  label='Selected query · attention mass per BEV cell')
     save_figure(fig,path,dpi)
@@ -177,6 +200,9 @@ def publication_figure(data, ctx, xyz, heads, history, radius, path, dpi, points
     _, segments = prediction_section(data, xyz, 'XY')
     scale = feature_maximum(data)
     fig = plt.figure(figsize=(13.6, 8.2), constrained_layout=True)
+    head_label = heads[0] if len(heads) == 1 else 'aggregate'
+    fig.suptitle(f"Sample {int(data['sample_index'])} · head {head_label} · "
+                 f"query {tuple(xyz)} · ego z = {center[2]:.2f} m", fontsize=12)
     layout = fig.add_gridspec(5,4,height_ratios=(1,1,.055,.06,.13))
     for j, (item, branch) in enumerate(zip(sources, BRANCHES)):
         ax = fig.add_subplot(layout[0,j])
@@ -187,10 +213,10 @@ def publication_figure(data, ctx, xyz, heads, history, radius, path, dpi, points
         ax = fig.add_subplot(layout[0,j+2])
         draw_context(ax, data, item, scale)
         overlay = mass_overlay(ax, masses[branch], data, max(m.max() for m in masses.values()))
-        draw_boundary(ax, segments)
+        draw_boundary(ax, segments, center[:2], radius)
         draw_sampling(ax, points[branch].reshape(-1,3), probs[branch].ravel(), center, (0,1))
         set_view(ax, (0,1), center, radius)
-        ax.set_title(f'({chr(99+j)}) {branch.capitalize()} query · fused K/V', fontsize=10)
+        ax.set_title(f'({chr(99+j)}) {branch_label(data, branch)} · fused K/V', fontsize=10)
     for j, (label, image) in enumerate(comparisons):
         ax = fig.add_subplot(layout[1,j])
         ax.set_title(f'({chr(101+j)}) {label}', fontsize=10)
@@ -251,7 +277,7 @@ def render_sample(path, out_dir, args):
     if args.classes and any(c not in CLASSES for c in args.classes):
         raise ValueError(f'Unknown class. Choose from {CLASSES}')
     if legacy:
-        if args.classes or args.strategy != 'auto' or args.selection_source != 'prediction' or any(
+        if args.num_queries != 1 or args.classes or args.strategy != 'auto' or args.selection_source != 'prediction' or any(
                 (args.acc, args.current_only, args.history_prediction)) or args.figure_mode == 'publication':
             raise ValueError('Semantic context requires a version 2 archive. Re-export this sample.')
         manual = args.query
@@ -266,6 +292,16 @@ def render_sample(path, out_dir, args):
         folder.mkdir(parents=True, exist_ok=True)
         stats = summarize(data)
         write_json(folder/'diagnostics.json', stats)
+        write_json(folder / 'queries.json', {
+            'sample_token': str(data['sample_token']),
+            'history_tokens': data['history_tokens'].tolist(),
+            'semantic_source': 'pooled predicted occupancy',
+            'voxel_xyz': list(map(int, xyz)),
+            'metric_xyz': metric_center(data, xyz).tolist(),
+            'selection': 'manual' if manual is not None else 'legacy peak-weight selection',
+            'head_indices': head_groups,
+            'normalization': 'softmax over sampling points per branch, head and query',
+        })
         diagnostic_histograms(stats, folder/'histograms', args.dpi)
         print(f'{path}: rendered pooled occupancy from the version 1 archive.')
         return 1
@@ -278,46 +314,67 @@ def render_sample(path, out_dir, args):
     write_json(folder/'diagnostics.json', stats)
     if args.figure_mode in ('both','diagnostic'):
         diagnostic_histograms(stats, folder/'histograms', args.dpi)
-    report = dict(sample_token=str(data['sample_token']), scene_token=str(data['scene_token']),
-                  sample_index=int(data['sample_index']), checkpoint=str(data['checkpoint']),
-                  history_tokens=data['history_tokens'].tolist(), frame='current LiDAR-time ego, metres',
-                  source='shared fused reference (K and V) for both branches',
-                  history_query='aligned historical feature' if len(data['history_tokens'])==1
-                  else 'recursively fused aligned historical features',
-                  visibility_source='Occ3D mask_camera (camera coverage proxy)',
-                  branch_contexts={b: ('current feature' if b == 'current' else 'aligned history') for b in BRANCHES},
-                  normalization='per branch, head and query; softmax over sampling points',
-                  selection_source=args.selection_source, strategy=args.strategy, classes=args.classes,
-                  radius_m=args.radius, queries=[], comparisons={k:ctx[k]['path'] for k in
-                  ('current_only','acc') if k in ctx}, history_predictions={
-                  k:v for k,v in ctx.items() if k.endswith('_path')})
+    histories = range(len(data['history_tokens']))
+    report = {
+        'sample_token': str(data['sample_token']),
+        'scene_token': str(data['scene_token']),
+        'sample_index': int(data['sample_index']),
+        'checkpoint': str(data['checkpoint']),
+        'history_tokens': data['history_tokens'].tolist(),
+        'frame': 'current LiDAR-time ego, metres',
+        'source': 'shared fused reference (K and V) for both branches',
+        'sampling_grid': 'XYZ, normalized to [-1,1], align_corners=True, border padding',
+        'boundary_source': 'final DTF semantic prediction, native-resolution intercell faces',
+        'projections': {'XY': 'z fixed', 'XZ': 'y fixed', 'YZ': 'x fixed'},
+        'history_query': ('aligned historical feature' if len(histories) == 1
+                          else 'recursively fused aligned historical features'),
+        'visibility_source': 'Occ3D mask_camera (camera coverage proxy)',
+        'normalization': 'softmax over sampling points per branch, head and query',
+        'selection_source': args.selection_source,
+        'strategy': args.strategy,
+        'classes': args.classes,
+        'radius_m': args.radius,
+        'queries': [],
+        'comparisons': {key: ctx[key]['path'] for key in ('current_only', 'acc') if key in ctx},
+        'history_predictions': {key: value for key, value in ctx.items() if key.endswith('_path')},
+    }
     for xyz, reason in candidates:
-        xyz = tuple(map(int,xyz))
+        xyz = tuple(map(int, xyz))
         qdir = folder / f'q{xyz[0]}-{xyz[1]}-{xyz[2]}'
         qdir.mkdir(exist_ok=True)
-        idx = tuple(fine_indices(data,xyz)[::-1])
-        center = metric_center(data,xyz)
-        confidence = ctx.get('current_only',{}).get('confidence',data['semantic_confidence_zyx'])
-        record = dict(voxel_xyz=list(xyz), metric_xyz=center.tolist(), selection=reason,
-                      selected_class=class_name(data['gt_zyx' if args.selection_source=='gt'
-                                                      else 'prediction_zyx'][idx]),
-                      predicted_class=class_name(data['prediction_zyx'][idx]),
-                      gt_class=class_name(data['gt_zyx'][idx]) if 'gt_zyx' in data else None,
-                      semantic_confidence=float(confidence[idx]), confidence_source='current-only'
-                      if 'confidence' in ctx.get('current_only',{}) else 'DTF final prediction',
-                      current_camera_visible=bool(data['visible_zyx'][idx]) if 'visible_zyx' in data else None,
-                      history_camera_visible=[bool(ctx[f'history_{i}_visible'][idx])
-                      if f'history_{i}_visible' in ctx else None for i in range(len(data['history_tokens']))],
-                      heads=[])
-        record['local_xy_iou'] = local_class_iou(data, ctx, xyz, args.radius,
-                                                data['gt_zyx' if args.selection_source == 'gt' else 'prediction_zyx'][idx])
+        idx = tuple(fine_indices(data, xyz)[::-1])
+        selection_key = 'gt_zyx' if args.selection_source == 'gt' else 'prediction_zyx'
+        class_id = data[selection_key][idx]
+        current = ctx.get('current_only', {})
+        confidence = current.get('confidence', data['semantic_confidence_zyx'])
+        record = {
+            'voxel_xyz': list(xyz),
+            'metric_xyz': metric_center(data, xyz).tolist(),
+            'reference_grid_xyz': [2.0 * i / (n - 1) - 1 if n > 1 else 0.0
+                                   for i, n in zip(xyz, data['occupied_zyx'].shape[::-1])],
+            'fine_voxel_xyz': list(map(int, idx[::-1])),
+            'selection': reason,
+            'current_context': context_image(data, ctx, xyz)[0],
+            'history_contexts': [context_image(data, ctx, xyz, i)[0] for i in histories],
+            'selected_class': class_name(class_id),
+            'predicted_class': class_name(data['prediction_zyx'][idx]),
+            'gt_class': class_name(data['gt_zyx'][idx]) if 'gt_zyx' in data else None,
+            'semantic_confidence': float(confidence[idx]),
+            'confidence_source': 'current-only' if 'confidence' in current else 'DTF final prediction',
+            'current_camera_visible': bool(data['visible_zyx'][idx]) if 'visible_zyx' in data else None,
+            'history_camera_visible': [
+                bool(ctx[f'history_{i}_visible'][idx]) if f'history_{i}_visible' in ctx else None
+                for i in histories],
+            'local_xy_iou': local_class_iou(data, ctx, xyz, args.radius, class_id),
+            'heads': [],
+        }
         if args.figure_mode in ('both','publication'):
             contexts_figure(data,ctx,xyz,args.radius,qdir/'semantic_context',args.dpi)
         for group in head_groups:
             tag = f'h{group[0]}' if len(group)==1 else 'aggregate'
             points, probs, masses = query_masses(data,group,xyz)
             record['heads'].append(dict(indices=group, group=tag, points={
-                b:dict(metric_xyz=points[b].tolist(), weights=probs[b].tolist()) for b in BRANCHES}))
+                b: point_record(data, ctx, points[b], probs[b]) for b in BRANCHES}))
             if args.figure_mode in ('both','diagnostic'):
                 diagnostic_figure(data,qdir/(tag+'_diagnostic'),group,xyz,args.radius,args.dpi)
             attention_figure(data,xyz,masses,args.radius,qdir/(tag+'_attention_bev'),args.dpi)
