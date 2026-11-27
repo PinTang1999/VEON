@@ -179,7 +179,7 @@ def set_view(ax, dims, center, radius=None):
 
 def figure_key(ax, pooled=False):
     from matplotlib.lines import Line2D
-    name = 'Predicted occupancy boundary' + (' (pooled)' if pooled else ' (DTF)')
+    name = 'Predicted occupancy boundary (pooled)' if pooled else 'Predicted semantic boundary'
     handles = [Line2D([], [], **BOUNDARY, label=name),
                Line2D([], [], **CONNECTION, label='Sampling connections'),
                Line2D([], [], marker='x', lw=0, color=QUERY['color'], label='Query voxel'),

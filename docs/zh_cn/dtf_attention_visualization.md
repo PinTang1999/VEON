@@ -10,11 +10,11 @@
 
 | 图例 | 数据和画法 |
 | --- | --- |
-| Predicted occupancy boundary | 赭色实线，来自最终 DTF 预测标签；叠加在其他帧背景上时仍表示当前帧的最终 DTF 预测 |
+| Predicted semantic boundary | 赭色实线，来自最终 DTF 预测标签；叠加在其他帧背景上时仍表示当前帧的最终 DTF 预测 |
 | Sampling connections | 半透明灰色虚线，连接 query 中心与实际采样点的二维投影 |
 | Query voxel / Sampling location | 红叉为 query 中心，圆点为实际采样位置，颜色和面积表示原始权重 |
 
-XY 固定 query 的 z，XZ 固定 y，YZ 固定 x。三维采样点投影到这三个平面，终点可以来自切片以外的体素。坐标轴均为当前 LiDAR 时刻自车坐标，单位为米，每个方向均使用同一物理比例。若中心恰落在两个细体素之间，使用左闭右开的网格约定。统一颜色的类内区域不会凭空出现轮廓。
+在三维采样诊断图中，XY 固定 query 的 z，XZ 固定 y，YZ 固定 x。三维采样点投影到这三个平面，终点可以来自切片以外的体素。坐标轴均为当前 LiDAR 时刻自车坐标，单位为米，每个方向均使用同一物理比例。若中心恰落在两个细体素之间，使用左闭右开的网格约定。统一颜色的类内区域不会凭空出现轮廓。
 
 ## 服务器运行
 
@@ -71,8 +71,10 @@ bash tools/run_dtf_visualization.sh plot work_dirs/dtf_ijcv_t2/sample_000001.npz
 - 自动模式的 `--classes` 接受 Occ3D 类别名，如 car、truck、bus、pedestrian、bicycle、motorcycle、barrier。默认候选为已占用的已知类别。`--selection-source prediction` 使用 DTF 标签，`gt` 使用当前 GT，并在元数据中记录。
 - `auto` 优先考虑边界、可移动类别和低语义置信度。`boundary` 筛选边界，`dynamic` 筛选可移动类别（含停车车辆），`low-confidence` 按语义置信度从低到高选取。有独立 current-only 置信度时优先使用，否则记录和使用 DTF 最终语义置信度。`occluded` 要求当前 `mask_camera` 为假且至少一个不同历史帧对齐后为真。这是相机覆盖代理条件。运动速度和被遮挡物体的实例身份需要其他证据。
 - `--num-queries` 控制每个样本的上限，邻近体素会被抑制以减少重复示例。`--sample-stride` 控制批量扫描步长。`--radius` 控制局部半径，默认 ±4 m。
-- 当前帧背景依次选独立 current-only 预测、当前 GT、当前特征的通道 RMS。每个历史背景依次选真实历史预测、历史 GT、模型实际使用的已对齐特征 RMS。面板标题标明实际来源。GT 和历史独立预测按各帧 LiDAR-time ego 位姿做完整 SE(3) 变换，对类别和可见性做最近邻取样。超出历史范围的类别记为 unknown。
-- 可选的 current-only 与 ACC 面板显示独立训练模型的结果。缺失的对照标为 `Unavailable`。如有 GT，在 `queries.json` 记录当前 query 类别在局部 XY 切片上的 intersection、union 和 IoU。各模型使用共同的有效区域，有相机掩码时只统计可见体素。该局部结果不能替代验证集上的整体评测。
+- 全局和局部语义背景都从最高 Z 层向下取首个可见占用标签。遇到 free 或 unknown 继续向下。有观测但全为空闲的列显示白色，完全无观测的列显示灰色。当前 GT 和论文预测使用当前相机掩码；历史 GT 使用经过同一 SE(3) 最近邻重采样的历史掩码。缺少掩码时面板标记 Unavailable，同时输出警告。
+- `semantic_context_raw` 保留完整 DTF 预测。样本级 `projection_diagnostics.json` 记录各源的类别数和比例、无观测列数、相机可见体素比例和首个占用高度分布。高度 −1 表示没有占用命中。查询的具体高度和该体素的原始类别、可见性另存于 `queries.json`。
+- `*_attention_bev` 跨全部高度累积端点概率。`*_attention_query_height` 仅累积落入 query 所在细体素 Z 层的端点，沿用原始概率，质量和可以小于 1。论文叠加图中的语义颜色取每列首个占用体素，采样概率则跨高度累积。
+- 可选的 current-only 与 ACC 面板显示独立训练模型的结果。缺失的对照标为 `Unavailable`。如有 GT，在 `queries.json` 记录当前 query 类别在局部俯视投影上的 intersection、union 和 IoU。各模型使用共同的有效区域，有相机掩码时只统计可见体素。该局部结果不能替代验证集上的整体评测。
 
 提供服务器独立训练的 ACC 配置和权重时，在主模型完成导出后按相同 sample token 运行 ACC，并保存 `acc/{token}.npz`。
 

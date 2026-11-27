@@ -267,6 +267,11 @@ def test_t3_publication_and_comparison_inputs(tmp_path):
     with np.load(qdir/'aggregate_attention_mass.npz', allow_pickle=False) as f:
         for b in BRANCHES:
             assert f[b].sum() == pytest.approx(1.)
+            points = rec['heads'][0]['points'][b]
+            z = np.asarray(points['fine_voxel_xyz'])[..., 2]
+            weights = np.asarray(points['weights'])
+            expected = np.where(z == rec['query_z_index'], weights, 0).sum(axis=1).mean()
+            assert f[b + '_query_height'].sum() == pytest.approx(expected)
 
 
 @pytest.mark.parametrize('frames', [2, 3])
@@ -391,3 +396,37 @@ def test_acc_export_matches_tokens_and_native_grid(monkeypatch, tmp_path):
     cfg.grid_config['x'][1] = 3
     with pytest.raises(ValueError, match='extents differ'):
         cli.export_acc_predictions(args, [path])
+
+
+def test_first_hit_projection_and_visibility():
+    from tools.analysis_tools.dtf_projection import topdown_semantic_projection
+    labels = np.array([[[4, 5, 6, 17, 255, 7]], [[3, 17, 255, 17, 255, 4]]], np.uint8)
+    visible = np.ones_like(labels, bool)
+    visible[1, 0, 5] = False
+    original = labels.copy()
+    image, valid, heights = topdown_semantic_projection(labels, visible)
+    np.testing.assert_array_equal(image, [[3, 5, 6, 17, 255, 7]])
+    np.testing.assert_array_equal(valid, [[True, True, True, True, False, True]])
+    np.testing.assert_array_equal(heights, [[1, 0, 0, -1, -1, 0]])
+    np.testing.assert_array_equal(original, labels)
+    assert topdown_semantic_projection(labels)[0][0, 5] == 4
+
+
+def test_projected_aligned_mask_and_axis_orientation():
+    from tools.analysis_tools.dtf_scene import prepare_context
+    from tools.analysis_tools.dtf_projection import projected_scene
+    data = scene_arrays(1)
+    data['ego_to_global'][1, 0, 3] = .5  # one positive fine X cell
+    data['history_0_visible'][:] = False
+    data['history_0_visible'][1, 1, 5] = True
+    images, stats = projected_scene(data, prepare_context(data))
+    assert images['history_0_gt'][1, 6] == 3
+    assert images['history_0_gt'][1, 5] == 255
+    assert images['current_gt'][1, 5] == 17
+    assert images['dtf_raw'][1, 5] == 4 and images['dtf_visible'][1, 5] == 17
+    assert stats['sources']['history_0_gt']['unobserved_columns'] == 23
+    del data['visible_zyx']
+    with pytest.warns(RuntimeWarning, match='missing camera visibility'):
+        images, stats = projected_scene(data, prepare_context(data))
+    assert images['current_gt'] is None and images['dtf_visible'] is None
+    assert len(stats['warnings']) == 2
