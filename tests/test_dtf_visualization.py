@@ -71,11 +71,15 @@ def test_offline_shell_renders_pdf_and_png(tmp_path):
     with np.load(path, allow_pickle=False) as data:
         validate_archive(data)
     root = Path(__file__).resolve().parents[1]
+    # A regular third-party "tools" package used to shadow the local CLI.
+    other_tools = tmp_path / 'tools'
+    other_tools.mkdir()
+    (other_tools / '__init__.py').touch()
     # Fail if the plotting CLI ever starts importing the training stack.
     (tmp_path / 'sitecustomize.py').write_text(
         "import sys\nfor mod in ('torch', 'mmcv', 'mmdet', 'mmdet3d', 'nuscenes'):\n"
         "    sys.modules[mod] = None\n")
-    env = dict(os.environ, PYTHON=sys.executable, PYTHONPATH=str(tmp_path),
+    env = dict(os.environ, PYTHON=sys.executable, PYTHONPATH=str(tmp_path), PYTHONSAFEPATH='1',
                MPLCONFIGDIR=str(tmp_path / 'mpl'))
     subprocess.run([str(root / 'tools/run_dtf_visualization.sh'), 'plot', str(path),
                     '--head', '1', '--query', '2', '1', '1', '--dpi', '96'],

@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+for entry in tools/__init__.py tools/dtf_visualization.py; do
+  if [[ ! -f "$entry" ]]; then
+    printf 'Missing %s/%s. Sync the VEON tools directory to this checkout.\n' "$PWD" "$entry" >&2
+    exit 1
+  fi
+done
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 
 case "${1:-}" in
   run|export|plot|-h|--help) ;;
