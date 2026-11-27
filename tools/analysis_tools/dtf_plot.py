@@ -13,7 +13,7 @@ def validate_archive(data):
     missing = required.difference(data)
     if missing:
         raise ValueError('Missing DTF archive fields: ' + ', '.join(sorted(missing)))
-    if int(data['schema_version']) != 1:
+    if int(data['schema_version']) not in (1, 2):
         raise ValueError('Unsupported DTF archive version')
     origin, spacing = (np.asarray(data[k]) for k in ('origin_xyz', 'voxel_size_xyz'))
     if (origin.shape != (3,) or spacing.shape != (3,) or not np.isfinite(origin).all()
@@ -34,6 +34,47 @@ def validate_archive(data):
         if (not np.isfinite(weights).all() or weights.min() < 0 or weights.max() > 1
                 or not np.allclose(weights.sum(axis=1), 1., atol=1e-3, rtol=0)):
             raise ValueError(f'Invalid {branch} softmax probabilities along the sample axis')
+
+    if int(data['schema_version']) == 2:
+        required_v2 = {'prediction_zyx', 'fine_voxel_size_xyz', 'palette_rgb', 'ego_to_global',
+                       'history_indices', 'semantic_confidence_zyx', 'occupancy_probability_zyx'}
+        required_v2.update(b + '_pre_tanh_xyz' for b in BRANCHES)
+        required_v2.update(f'feature_rms_{i}' for i in range(1 + len(data['history_tokens'])))
+        missing = required_v2.difference(data)
+        if missing:
+            raise ValueError('Missing semantic archive fields: ' + ', '.join(sorted(missing)))
+        from .dtf_scene import CLASSES, UNKNOWN
+        pred = data['prediction_zyx']
+        fine = np.asarray(data['fine_voxel_size_xyz'])
+        coarse = np.array(shape[-3:])
+        nframes = 1 + len(data['history_tokens'])
+        if (pred.ndim != 3 or np.any(np.array(pred.shape) % coarse)
+                or fine.shape != (3,) or not np.allclose(fine * pred.shape[::-1], spacing * coarse[::-1])
+                or data['palette_rgb'].shape != (len(CLASSES), 3)):
+            raise ValueError('Inconsistent native semantic grid or palette')
+        poses = np.asarray(data['ego_to_global'])
+        if (poses.shape != (nframes, 4, 4) or len(data['history_indices']) != nframes-1
+                or not np.isfinite(poses).all() or not np.allclose(poses[:, 3], [0,0,0,1])):
+            raise ValueError('Invalid frame pose metadata')
+        for key in ('semantic_confidence_zyx', 'occupancy_probability_zyx'):
+            v = data[key]
+            if v.shape != pred.shape or not np.isfinite(v).all() or v.min() < 0 or v.max() > 1:
+                raise ValueError(f'Invalid {key}')
+        for key in ['prediction_zyx', 'gt_zyx'] + [f'history_{i}_gt' for i in range(nframes-1)]:
+            if key in data and (data[key].shape != pred.shape or data[key].dtype.kind not in 'iu'
+                                or not np.isin(data[key], list(range(len(CLASSES))) + [UNKNOWN]).all()):
+                raise ValueError(f'Invalid semantic labels in {key}')
+        for key in ['visible_zyx'] + [f'history_{i}_visible' for i in range(nframes-1)]:
+            if key in data and (data[key].shape != pred.shape or data[key].dtype != np.bool_):
+                raise ValueError(f'Invalid visibility in {key}')
+        for i in range(nframes):
+            rms = data[f'feature_rms_{i}']
+            if rms.shape != tuple(coarse) or not np.isfinite(rms).all():
+                raise ValueError('Invalid aligned feature map')
+        for b in BRANCHES:
+            raw = data[b + '_pre_tanh_xyz']
+            if raw.shape != shape + (3,) or not np.isfinite(raw).all():
+                raise ValueError(f'Invalid {b} pre-Tanh offsets')
 
 
 def select_query(data, head, xyz):
@@ -59,97 +100,147 @@ def sampled_displacements(grid_xyz, shape_zyx, xyz, spacing):
     return (sample_indices - xyz) * spacing
 
 
-def probability_scale(low, high):
-    from matplotlib.colors import Normalize
+BOUNDARY = dict(color='#b24b16', linestyle='-', linewidth=1.2)
+CONNECTION = dict(color='#414958', linestyle='--', linewidth=.9, alpha=.65)
+QUERY = dict(marker='x', color='#ea3027', s=70, linewidths=2., zorder=6)
 
-    if np.isclose(low, high, rtol=0, atol=1e-7):
-        return Normalize(0., 1.), [(low + high) / 2.]
-    return Normalize(low, high), None
+
+def sample_points(data, branch, heads, xyz):
+    from .dtf_scene import metric_center
+    x, y, z = xyz
+    probs = data[branch + '_weights'][heads, :, z, y, x]
+    grid = data[branch + '_grid_xyz'][heads, :, z, y, x]
+    delta = sampled_displacements(grid, data['occupied_zyx'].shape, xyz, data['voxel_size_xyz'])
+    return metric_center(data, xyz) + delta, probs
+
+
+def semantic_image(ax, data, image, plane, fine=True):
+    from .dtf_scene import PLANES, FREE, UNKNOWN
+    dims = list(PLANES[plane])
+    origin = np.asarray(data['origin_xyz'])[dims]
+    spacing = np.asarray(data['fine_voxel_size_xyz' if fine else 'voxel_size_xyz'])[dims]
+    upper = origin + spacing * image.shape[::-1]
+    if 'palette_rgb' in data:
+        palette = np.full((256, 3), 223, np.uint8)
+        palette[:18] = data['palette_rgb']
+        palette[FREE] = 255
+        rgb = palette[image]
+    else:
+        rgb = np.where(image[..., None] == FREE, 255, 218).astype(np.uint8).repeat(3, axis=2)
+        rgb[image == UNKNOWN] = 223
+    ax.set_facecolor('#dfdfdf')
+    ax.imshow(rgb, origin='lower', extent=(origin[0], upper[0], origin[1], upper[1]),
+              interpolation='nearest', aspect='equal', zorder=0)
+
+
+def draw_boundary(ax, segments):
+    from matplotlib.collections import LineCollection
+    if len(segments):
+        from matplotlib import patheffects
+        lines = LineCollection(segments, **BOUNDARY, zorder=2)
+        lines.set_path_effects([patheffects.Stroke(linewidth=1.9, foreground='white'),
+                                patheffects.Normal()])
+        ax.add_collection(lines, autolim=False)
+
+
+def draw_query(ax, center, dims):
+    ax.scatter(center[dims[0]], center[dims[1]], **QUERY)
+
+
+def draw_sampling(ax, points, probs, center, dims):
+    from matplotlib.collections import LineCollection
+    p = points.reshape(-1, 3)[:, list(dims)]
+    weights = probs.ravel()
+    lines = np.stack((np.broadcast_to(center[list(dims)], p.shape), p), axis=1)
+    ax.add_collection(LineCollection(lines, **CONNECTION, zorder=3))
+    order = weights.argsort()
+    ax.scatter(*p[order].T, c=weights[order], cmap='viridis', vmin=0, vmax=1,
+               s=17 + 90*weights[order], edgecolors='black', linewidths=.4, zorder=4)
+    draw_query(ax, center, dims)
+
+
+def set_view(ax, dims, center, radius=None):
+    if radius is not None:
+        ax.set_xlim(center[dims[0]]-radius, center[dims[0]]+radius)
+        ax.set_ylim(center[dims[1]]-radius, center[dims[1]]+radius)
+    ax.set(xlabel=f'Ego {"xyz"[dims[0]]} (m)', ylabel=f'Ego {"xyz"[dims[1]]} (m)', aspect='equal')
+
+
+def figure_key(ax, pooled=False):
+    from matplotlib.lines import Line2D
+    name = 'Predicted occupancy boundary' + (' (pooled)' if pooled else '')
+    handles = [Line2D([], [], **BOUNDARY, label=name),
+               Line2D([], [], **CONNECTION, label='Sampling connections'),
+               Line2D([], [], marker='x', lw=0, color=QUERY['color'], label='Query voxel'),
+               Line2D([], [], marker='o', lw=0, color='#25868e', label='Sampling location')]
+    ax.set_axis_off()
+    ax.legend(handles=handles, loc='center', ncol=4, frameon=False, fontsize=8)
+
+
+def save_figure(fig, stem, dpi):
+    from matplotlib import pyplot as plt, rc_context
+    stem.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with rc_context({'pdf.fonttype': 42}):
+            paths = [stem.with_suffix(ext) for ext in ('.pdf', '.png')]
+            for path in paths:
+                fig.savefig(path, dpi=dpi, bbox_inches='tight', facecolor='white')
+            return paths
+    finally:
+        plt.close(fig)
+
+
+def diagnostic_figure(data, stem, heads, xyz, radius, dpi):
+    from matplotlib import pyplot as plt
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+    from .dtf_scene import PLANES, metric_center, prediction_section
+
+    x, y, z = xyz
+    center = metric_center(data, xyz)
+    shape = data['occupied_zyx'].shape
+    origin, spacing = data['origin_xyz'], data['voxel_size_xyz']
+    extent = (origin[0], origin[0]+spacing[0]*shape[2], origin[1], origin[1]+spacing[1]*shape[1])
+    fig = plt.figure(figsize=(13, 7.4), constrained_layout=True)
+    layout = fig.add_gridspec(4, 4, height_ratios=[1, 1, .045, .05])
+    sections = {plane: prediction_section(data, xyz, plane) for plane in PLANES}
+    for i, branch in enumerate(BRANCHES):
+        ax = fig.add_subplot(layout[i, 0])
+        peak = data[branch+'_weights'][heads, :, z].max(axis=1).mean(axis=0)
+        ax.imshow(peak, origin='lower', extent=extent, interpolation='nearest', cmap='magma', vmin=0, vmax=1)
+        draw_boundary(ax, sections['XY'][1])
+        draw_query(ax, center, (0, 1))
+        ax.set_title(branch.capitalize()+' query · peak weight')
+        set_view(ax, (0, 1), center)
+        points, weights = sample_points(data, branch, heads, xyz)
+        for j, (plane, dims) in enumerate(PLANES.items(), 1):
+            ax = fig.add_subplot(layout[i, j])
+            labels, segments = sections[plane]
+            semantic_image(ax, data, labels, plane, fine='prediction_zyx' in data)
+            draw_boundary(ax, segments)
+            draw_sampling(ax, points, weights, center, dims)
+            set_view(ax, dims, center, radius)
+            if i == 0:
+                ax.set_title(plane+' sampling projection')
+    for cmap, spec, name in [('magma', layout[2, 0], 'Peak probability'),
+                             ('viridis', layout[2, 1:], 'Sampling point probability')]:
+        fig.colorbar(ScalarMappable(norm=Normalize(0,1), cmap=cmap), cax=fig.add_subplot(spec),
+                     orientation='horizontal', label=name)
+    figure_key(fig.add_subplot(layout[3, :]), pooled='prediction_zyx' not in data)
+    head = str(heads[0]) if len(heads)==1 else 'aggregate'
+    repeated = str(data['sample_token']) in data['history_tokens']
+    fig.suptitle(f"Sample {int(data['sample_index'])} · head {head} · query ({x}, {y}, {z})"
+                 + (' · repeated history frame' if repeated else ''))
+    return save_figure(fig, stem, dpi)
 
 
 def render_archive(path, out_dir, head=0, xyz=None, dpi=300):
     import matplotlib
     matplotlib.use('Agg')
-    from matplotlib import pyplot as plt
-    from matplotlib.lines import Line2D
-    from matplotlib.ticker import ScalarFormatter
-
     with np.load(path, allow_pickle=False) as archive:
         data = dict(archive)
     validate_archive(data)
-    x, y, z = select_query(data, head, xyz)
-    spacing, origin = data['voxel_size_xyz'], data['origin_xyz']
-    shape = data['occupied_zyx'].shape
-    _, ny, nx = shape
-    center = origin + (np.array([x, y, z]) + .5) * spacing
-    extent = (origin[0], origin[0] + nx * spacing[0], origin[1], origin[1] + ny * spacing[1])
-    peaks = [data[b + '_weights'][head, :, z].max(axis=0) for b in BRANCHES]
-    probabilities = [data[b + '_weights'][head, :, z, y, x] for b in BRANCHES]
-    # Independent shared scales for voxel-wise maxima and individual samples.
-    # Include the uniform value even when every head is nearly uniform.
-    uniform = 1. / probabilities[0].size
-    peak_norm, peak_ticks = probability_scale(min(uniform, *(p.min() for p in peaks)),
-                                              max(uniform, *(p.max() for p in peaks)))
-    sample_norm, sample_ticks = probability_scale(min(p.min() for p in probabilities),
-                                                  max(p.max() for p in probabilities))
-    cmap = 'viridis'
-    mask = data['occupied_zyx'][z]
-    contour = min(nx, ny) > 1 and mask.any() and not mask.all()
-    fig = plt.figure(figsize=(10.4, 7.2), constrained_layout=True)
-    layout = fig.add_gridspec(4, 3, height_ratios=(1, 1, .055, .04))
-    axes = np.array([[fig.add_subplot(layout[r, c]) for c in range(3)] for r in range(2)])
-    try:
-        for row, branch in enumerate(BRANCHES):
-            bev, xy, xz = axes[row]
-            heatmap = bev.imshow(peaks[row], origin='lower', extent=extent, cmap=cmap,
-                                 norm=peak_norm, interpolation='nearest', aspect='equal')
-            if contour:
-                bev.contour(origin[0] + (np.arange(nx) + .5) * spacing[0],
-                            origin[1] + (np.arange(ny) + .5) * spacing[1], mask,
-                            levels=[.5], colors='white', linewidths=.45, alpha=.65)
-            bev.scatter(*center[:2], marker='x', color='#f34c36', s=65, linewidths=2)
-            bev.set(title=branch.capitalize() + ' query · peak weight',
-                    xlabel='Ego x (m)', ylabel='Ego y (m)', xlim=extent[:2], ylim=extent[2:])
-
-            probs = probabilities[row]
-            grid = data[branch + '_grid_xyz'][head, :, z, y, x, :]
-            delta = sampled_displacements(grid, shape, (x, y, z), spacing)
-            order = probs.argsort()
-            for ax, dim in ((xy, 1), (xz, 2)):
-                for endpoint in delta:
-                    ax.plot([0, endpoint[0]], [0, endpoint[dim]], color='0.72', lw=.8, zorder=1)
-                points = ax.scatter(delta[order, 0], delta[order, dim], c=probs[order], cmap=cmap,
-                                    norm=sample_norm, s=48, linewidths=.45, edgecolors='0.25', zorder=2)
-                ax.scatter(0, 0, marker='x', color='#f34c36', s=65, linewidths=2, zorder=3)
-                # The tanh offset generator spans one DTF cell on each axis.
-                ax.set(xlim=(-1.15 * spacing[0], 1.15 * spacing[0]),
-                       ylim=(-1.15 * spacing[dim], 1.15 * spacing[dim]),
-                       xlabel='Δx (m)', ylabel=f'Δ{"xyz"[dim]} (m)', aspect='equal')
-                ax.grid(alpha=.15)
-        axes[0, 1].set_title('Sampling in the ground plane')
-        axes[0, 2].set_title('Sampling in elevation')
-        repeated = str(data['sample_token']) in data['history_tokens']
-        title = (f'DTF attention · sample {int(data["sample_index"])} · head {head} · '
-                 f'query ({x}, {y}, {z})')
-        fig.suptitle(title + (' · repeated history frame' if repeated else ''), fontsize=14)
-        fig.colorbar(heatmap, cax=fig.add_subplot(layout[2, 0]), orientation='horizontal',
-                     label='Peak probability across samples', ticks=peak_ticks,
-                     format=ScalarFormatter(useOffset=False))
-        fig.colorbar(points, cax=fig.add_subplot(layout[2, 1:]), orientation='horizontal',
-                     label='Sampling point probability', ticks=sample_ticks,
-                     format=ScalarFormatter(useOffset=False))
-        handles = [Line2D([], [], marker='x', lw=0, color='#f34c36', label='Query voxel')]
-        if contour:
-            handles.append(Line2D([], [], color='0.5', lw=1, label='Predicted occupancy boundary'))
-        legend = fig.add_subplot(layout[3, :])
-        legend.set_axis_off()
-        legend.legend(handles=handles, loc='center', ncol=len(handles), frameon=False, fontsize=9)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        prefix = f'{path.stem}_h{head}_q{x}-{y}-{z}'
-        paths = [out_dir / (prefix + ext) for ext in ('.pdf', '.png')]
-        with matplotlib.rc_context({'pdf.fonttype': 42, 'ps.fonttype': 42}):
-            for dest in paths:
-                fig.savefig(dest, dpi=dpi, bbox_inches='tight')
-        return paths
-    finally:
-        plt.close(fig)
+    xyz = select_query(data, head, xyz)
+    x, y, z = xyz
+    return diagnostic_figure(data, out_dir / f'{path.stem}_h{head}_q{x}-{y}-{z}',
+                             [head], xyz, 4., dpi)

@@ -322,3 +322,32 @@ def test_dtf_capture_uninstalls_observer_after_incomplete_forward():
         with capture_attention(dtf):
             raise ValueError('forward failed')
     assert dtf.attention_observer is None
+
+
+def test_capture_scene_observes_pre_tanh_and_aligned_frames():
+    from types import SimpleNamespace
+    from tools.dtf_visualization import capture_scene
+    deform = load_class(ALIGN, 'TemporalDeformable')
+    middle = load_class(ALIGN, 'TemporalFusionDeformMiddle',
+                        extra_namespace=dict(TemporalDeformable=deform))(channels=4)
+    dtf = middle.t_deform = deform(4, num_heads=2, num_samples=3)
+    class Fusion(nn.Module):
+        def forward(self, current, history):
+            return middle(current + history[0], current, history[0])
+    fusion = Fusion()
+    model = SimpleNamespace(semantic_model=SimpleNamespace(model=SimpleNamespace(
+        occ_decoder=SimpleNamespace(temporal_fusion=fusion))))
+    dtf.eval()
+    current, prev, prev2 = torch.randn(3,1,4,2,3,4)
+    with torch.no_grad():
+        expected = fusion(current, [prev,prev2])
+        with capture_scene(model,dtf) as arrays:
+            actual = fusion(current, [prev,prev2])
+            model.dtf_confidence_observer(current[:,0], prev[:,0])
+        assert torch.equal(expected,actual)
+        for b in ('current','history'):
+            torch.testing.assert_close(torch.from_numpy(arrays[b+'_pre_tanh_xyz']).tanh(),
+                                       torch.from_numpy(arrays[b+'_offsets_xyz']))
+        torch.testing.assert_close(torch.from_numpy(arrays['feature_rms_2']), prev2.square().mean(dim=1).sqrt()[0])
+        assert torch.equal(torch.from_numpy(arrays['semantic_confidence_zyx']),current[0,0])
+        assert not hasattr(model,'dtf_confidence_observer') and dtf.attention_observer is None

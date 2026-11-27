@@ -244,6 +244,10 @@ class VeonTemporal(Base3DDetector):
         occ_pred_cls = torch.where(sel_tag, sem_occ_cls, torch.ones_like(sem_occ_cls) * free_idx)
         occ_pred_cls = occ_pred_cls.permute(0, 3, 2, 1).contiguous()
 
+        observer = getattr(self, 'dtf_confidence_observer', None)
+        if observer is not None:
+            observer(sem_occ_score.detach(), bin_occ_softmax.detach())
+
         self.nonce += 1
         if self.retrieval:
             if self.retrieval_queries is not None:

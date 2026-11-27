@@ -179,6 +179,34 @@ def visualize_camera_images(
 
 
 
+NUSCENES_COLOR_MAP = np.array(
+    [
+        [175, 0, 75, 255],  # others                dark red
+        [255, 120, 50, 255],  # barrier              orange
+        [255, 192, 203, 255],  # bicycle              pink
+        [255, 255, 0, 255],  # bus                  yellow
+        [0, 255, 255, 255],  # car                  blue
+
+        [255, 0, 255, 255],  # construction_vehicle dark pink
+        [200, 180, 0, 255],  # motorcycle           dark orange
+        [255, 0, 0, 255],  # pedestrian           red
+        [255, 240, 150, 255],  # traffic_cone         light yellow
+        [135, 60, 0, 255],  # trailer              brown
+
+        [160, 32, 240, 255],  # truck                purple
+        [139, 137, 137, 255],  # driveable_surface    grey
+        # [175,   0,  75, 255],
+        [0, 150, 245, 255],  # other_flat           cyan
+        [75, 0, 75, 255],  # sidewalk             dark purple
+        [150, 240, 80, 255],  # terrain              light green
+
+        [230, 230, 250, 255],  # manmade              white
+        [0, 175, 0, 255],  # vegetation           green
+        [0, 0, 0, 255],  # ignore
+    ]
+)
+
+
 def vis_occ(pred_occ, occ_tag='default', occ_path=None, folder="default", use_semantic=True, heatmap=True, mode="nuscenes"):
     import open3d as o3d
 
@@ -188,33 +216,6 @@ def vis_occ(pred_occ, occ_tag='default', occ_path=None, folder="default", use_se
         os.makedirs(vis_occ_path, exist_ok=True)
 
     # Color map
-    NUSCENES_COLOR_MAP = np.array(
-        [
-            [175, 0, 75, 255],  # others                dark red
-            [255, 120, 50, 255],  # barrier              orange
-            [255, 192, 203, 255],  # bicycle              pink
-            [255, 255, 0, 255],  # bus                  yellow
-            [0, 255, 255, 255],  # car                  blue
-
-            [255, 0, 255, 255],  # construction_vehicle dark pink
-            [200, 180, 0, 255],  # motorcycle           dark orange
-            [255, 0, 0, 255],  # pedestrian           red
-            [255, 240, 150, 255],  # traffic_cone         light yellow
-            [135, 60, 0, 255],  # trailer              brown
-
-            [160, 32, 240, 255],  # truck                purple
-            [139, 137, 137, 255],  # driveable_surface    grey
-            # [175,   0,  75, 255],
-            [0, 150, 245, 255],  # other_flat           cyan
-            [75, 0, 75, 255],  # sidewalk             dark purple
-            [150, 240, 80, 255],  # terrain              light green
-
-            [230, 230, 250, 255],  # manmade              white
-            [0, 175, 0, 255],  # vegetation           green
-            [0, 0, 0, 255],  # ignore
-        ]
-    )
-
     SEMKITTI_COLOR_MAP = np.array(
         [
             [0, 0, 0, 255],  # ignore
@@ -240,7 +241,7 @@ def vis_occ(pred_occ, occ_tag='default', occ_path=None, folder="default", use_se
         ]
     ).astype(np.uint8)
 
-    color_map = NUSCENES_COLOR_MAP if mode == "nuscenes" else SEMKITTI_COLOR_MAP
+    color_map = NUSCENES_COLOR_MAP.copy() if mode == "nuscenes" else SEMKITTI_COLOR_MAP
 
     if heatmap and mode == "nuscenes":
         color_map[0] = np.array([45, 45, 45, 0])
