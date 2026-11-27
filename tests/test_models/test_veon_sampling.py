@@ -258,3 +258,67 @@ def test_deformable_identity_does_not_mix_batches_heads_or_samples():
     features = torch.arange(192.).reshape(2, 4, 2, 3, 4)
     output = model(features, features)
     torch.testing.assert_close(output, features, atol=1e-4, rtol=1e-5)
+
+
+@pytest.mark.parametrize('shape', [(2, 3, 5), (1, 4, 3)])
+def test_dtf_capture_matches_forward_tensors_and_preserves_output(monkeypatch, shape):
+    from tools.dtf_visualization import capture_attention
+
+    torch.manual_seed(42)
+    deform = load_class(ALIGN, 'TemporalDeformable')
+    middle = load_class(ALIGN, 'TemporalFusionDeformMiddle',
+                        extra_namespace=dict(TemporalDeformable=deform))(channels=4)
+    dtf = middle.t_deform = deform(channels=4, num_heads=2, num_samples=3)
+    middle.eval()
+    reference, current, history = torch.randn(3, 1, 4, *shape)
+    softmax = F.softmax
+    baseline_weights = []
+    keys, queries = [], []
+
+    def record(logits, dim):
+        assert dim == 2
+        weights = softmax(logits, dim=dim)
+        baseline_weights.append(weights[0].clone())
+        return weights
+
+    with torch.no_grad():
+        with monkeypatch.context() as patch:
+            patch.setattr(F, 'softmax', record)
+            dtf.key_value_proj.register_forward_pre_hook(lambda _, inputs: keys.append(inputs[0]))
+            dtf.query_proj.register_forward_pre_hook(lambda _, inputs: queries.append(inputs[0]))
+            baseline = middle(reference, current, history)
+        assert len(keys) == len(queries) == 2
+        assert all(key is reference for key in keys)
+        assert queries[0] is current and queries[1] is history
+        state_keys = set(middle.state_dict())
+        with capture_attention(dtf) as arrays:
+            captured = middle(reference, current, history)
+        assert torch.equal(captured, baseline)
+        assert dtf.attention_observer is None
+        assert set(middle.state_dict()) == state_keys
+        for branch, feat, weights in zip(('current', 'history'), (current, history),
+                                         baseline_weights):
+            raw = dtf.offset_conv(feat).reshape(2, 3, 3, *shape).permute(0, 1, 3, 4, 5, 2)
+            torch.testing.assert_close(torch.from_numpy(arrays[branch + '_weights']), weights)
+            torch.testing.assert_close(torch.from_numpy(arrays[branch + '_offsets_xyz']), raw)
+            # Compute expected effective positions in integer voxel space first.
+            z, y, x = torch.meshgrid(*(torch.arange(n) for n in shape), indexing='ij')
+            size = torch.tensor(shape[::-1]) - 1
+            positions = (torch.stack((x, y, z), dim=-1) + raw).clamp(min=0)
+            normalized = 2 * positions.minimum(size) / size.clamp(min=1) - 1
+            normalized[..., size == 0] = 0
+            torch.testing.assert_close(torch.from_numpy(arrays[branch + '_grid_xyz']), normalized)
+
+
+def test_dtf_capture_uninstalls_observer_after_incomplete_forward():
+    from tools.dtf_visualization import capture_attention
+
+    dtf = deformable().eval()
+    with pytest.raises(RuntimeError, match='Expected current and history'):
+        with capture_attention(dtf):
+            pass
+    assert dtf.attention_observer is None
+    with pytest.raises(ValueError, match='forward failed'):
+        with capture_attention(dtf):
+            raise ValueError('forward failed')
+    assert dtf.attention_observer is None

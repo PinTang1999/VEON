@@ -127,6 +127,7 @@ class TemporalDeformable(nn.Module):
         # )
         self.final_norm = nn.BatchNorm3d(channels)
         self.out_activate = nn.ReLU()
+        self.attention_observer = None
 
     def forward(self, feat_prev, feat_curr):
         B, C, D, H, W = feat_curr.shape
@@ -194,8 +195,10 @@ class TemporalDeformable(nn.Module):
         query = query.view(B, self.num_heads, self.head_dim, D, H, W)
         key = key.view(B, self.num_heads, self.num_samples, self.head_dim, D, H, W)
         query = query * (self.head_dim ** (-0.5))
-        attn = torch.einsum("bmcdhw,bmscdhw->bmsdhw", query, key)  # (B, H, D, H, W, N)
+        attn = torch.einsum("bmcdhw,bmscdhw->bmsdhw", query, key)  # (B, heads, samples, D, H, W)
         attn = F.softmax(attn, dim=2)
+        if self.attention_observer is not None:
+            self.attention_observer(attn.detach(), offsets.detach(), sampling_grid.detach())
 
         # Weighted sum
         fused_feat = torch.einsum('bmsdhw,bmscdhw->bmcdhw', attn, value) # (B, H, C/H, D, H, W)

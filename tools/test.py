@@ -131,6 +131,19 @@ def parse_args():
     return args
 
 
+def build_test_model(cfg, checkpoint_path):
+    """Build the evaluation model and apply both checkpoints in test order."""
+    cfg.model.train_cfg = None
+    model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
+    if cfg.get('fp16') is not None:
+        wrap_fp16_model(model)
+    checkpoint = load_checkpoint(model, checkpoint_path, map_location='cpu')
+    if 'depth_load_from' in cfg and 'depth_test_time' in cfg:
+        load_checkpoint(model, cfg.depth_load_from, map_location='cpu',
+                        revise_keys=cfg.get('depth_revise_keys', []))
+    return model, checkpoint
+
+
 def main():
     args = parse_args()
 
@@ -211,16 +224,7 @@ def main():
     if not args.no_aavt:
         if '4D' in cfg.model.type:
             cfg.model.align_after_view_transfromation=True
-    cfg.model.train_cfg = None
-    model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
-    fp16_cfg = cfg.get('fp16', None)
-    if fp16_cfg is not None:
-        wrap_fp16_model(model)
-    checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
-    # Loading the existing depth net
-    if 'depth_load_from' in cfg and 'depth_test_time' in cfg:
-        rk = cfg.depth_revise_keys if 'depth_revise_keys' in cfg else []
-        load_checkpoint(model, cfg.depth_load_from, map_location='cpu', revise_keys=rk)
+    model, checkpoint = build_test_model(cfg, args.checkpoint)
     if args.fuse_conv_bn:
         model = fuse_conv_bn(model)
     # old versions did not save class info in checkpoints, this walkaround is
