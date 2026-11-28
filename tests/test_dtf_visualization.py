@@ -452,3 +452,25 @@ def test_two_scene_comparison(tmp_path):
     for stem in ('acc_dtf_comparison', 'row1_xyz_diagnostic', 'row2_xyz_diagnostic'):
         assert (tmp_path / (stem + '.pdf')).read_bytes().startswith(b'%PDF')
         assert (tmp_path / (stem + '.png')).exists()
+
+
+def test_all_samples_cli_and_streaming(monkeypatch, tmp_path):
+    from tools import dtf_visualization as cli
+    from tools.analysis_tools import dtf_figures
+
+    assert not cli.parse_args(['run']).all_samples
+    with pytest.raises(SystemExit):
+        cli.parse_args(['export', '--all-samples', '--num-samples', '2'])
+    events = []
+    def archives(args):
+        assert args.all_samples
+        for index in range(2):
+            events.append(('export', index))
+            yield tmp_path / str(index)
+    def render(path, out_dir, args):
+        events.append(('plot', int(path.name)))
+        return 1
+    monkeypatch.setattr(cli, 'iter_sample_archives', archives)
+    monkeypatch.setattr(dtf_figures, 'render_sample', render)
+    cli.main(['run', '--all-samples'])
+    assert events == [('export', 0), ('plot', 0), ('export', 1), ('plot', 1)]

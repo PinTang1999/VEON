@@ -39,7 +39,10 @@ def parse_args(argv=None):
                              help='compare predicted occupancy labels to a second, uncaptured forward')
         command.add_argument('--acc-config', type=Path, help='independently trained ACC evaluation config')
         command.add_argument('--acc-checkpoint', type=Path, help='independently trained ACC checkpoint')
-        command.add_argument('--num-samples', type=int, default=1, help='number of dataset entries to inspect')
+        scope = command.add_mutually_exclusive_group()
+        scope.add_argument('--all-samples', action='store_true',
+                           help='process the configured test split to its end (default start: index 0)')
+        scope.add_argument('--num-samples', type=int, default=1, help='number of dataset entries to inspect')
         command.add_argument('--sample-stride', type=int, default=1)
         command.add_argument('--distinct-scenes', action='store_true',
                              help='choose at most one sample with distinct temporal frames per scene')
@@ -317,7 +320,7 @@ def evaluation_setup(config_path, gpu_id):
     return cfg, build_dataset(visualization_data_config(cfg.data.test))
 
 
-def export_samples(args):
+def iter_sample_archives(args):
     import numpy as np
     import torch
     from mmcv.parallel import MMDataParallel, collate
@@ -327,7 +330,10 @@ def export_samples(args):
 
     ckpt = resolve_checkpoint(args.checkpoint)
     cfg, dataset = evaluation_setup(args.config, args.gpu_id)
-    first = select_sample(dataset, args.sample_index, args.sample_token)
+    start = args.sample_index
+    if args.all_samples and start is None and args.sample_token is None:
+        start = 0
+    first = select_sample(dataset, start, args.sample_token)
     by_token = {info['token']: i for i, info in enumerate(dataset.data_infos)}
     model, checkpoint = build_test_model(cfg, str(ckpt))
     dtf = dict(model.named_modules()).get(DTF_PATH)
@@ -337,8 +343,8 @@ def export_samples(args):
     del checkpoint
     model = MMDataParallel(model.cuda(args.gpu_id), device_ids=cfg.gpu_ids)
     model.eval()
-    paths = []
-    for index in batch_indices(dataset, first, args.num_samples, args.sample_stride, args.distinct_scenes):
+    count = len(dataset) if args.all_samples else args.num_samples
+    for index in batch_indices(dataset, first, count, args.sample_stride, args.distinct_scenes):
         info = dataset.data_infos[index]
         adjacent = dataset.get_adj_info(info, index)
         if not adjacent:
@@ -367,9 +373,12 @@ def export_samples(args):
         path = args.out_dir / f'sample_{index:06d}.npz'
         save_archive(path, arrays)
         print(f'Saved {path} (per branch: heads, samples, Z, Y, X = {arrays["current_weights"].shape})')
-        paths.append(path)
-        del arrays
-    return paths
+        del arrays, batch, prediction
+        yield path
+
+
+def export_samples(args):
+    return list(iter_sample_archives(args))
 
 
 def export_acc_predictions(args, paths):
@@ -424,7 +433,10 @@ def main(argv=None):
         if not paths:
             raise ValueError(f'No sample archives in {args.npz}')
     else:
-        paths = export_samples(args)
+        if args.acc_checkpoint or args.mode == 'export':
+            paths = export_samples(args)
+        else:
+            paths = iter_sample_archives(args)
         if args.acc_checkpoint:
             args.acc = export_acc_predictions(args, paths)
     if args.mode != 'export':

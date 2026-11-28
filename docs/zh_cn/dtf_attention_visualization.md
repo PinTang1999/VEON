@@ -167,3 +167,12 @@ bash tools/run_dtf_visualization.sh compare work_dirs/dtf_cases --radius 2.4 --h
 输出 `acc_dtf_comparison.{png,pdf,json}` 和两行对应的 `row{1,2}_xyz_diagnostic.{png,pdf}`。第一行根据当前可见 GT 的语义边界选点，优先可移动类别。第二行优先历史可见、当前不可见的前景体素，也可选择对齐后双方可见但语义不同的体素。后一条件不能单独证明物体运动。程序要求两个不同场景，JSON 记录实际采用的依据和历史帧 token。
 
 灰点是一个单位膨胀率 3×3×3 卷积在 DTF 网格上的理论采样中心的 XY 投影。虚框覆盖这九个投影体素的完整格面范围。后三列共用相机可见的 DTF 首命中俯视预测。彩色圆点投影所有实际采样高度，颜色及面积使用原始概率。aggregate 保留每个 head 的独立端点。T3 的历史分支使用递归融合特征，历史 GT 列展示 JSON 指定的单帧背景。
+
+### 遍历整个验证集
+
+```bash
+bash tools/run_dtf_visualization.sh run --all-samples --query 18 54 1 \
+  --head aggregate --figure-mode publication --out-dir work_dirs/dtf_full_val
+```
+
+`--all-samples` 从索引 0 遍历当前配置的 test split（默认配置为 nuScenes 验证集）。保留 `--sample-index 1100` 可从该索引处理到末尾。默认 DTF 模型只加载一次，每完成一个样本就保存 NPZ 并绘图。若另行提供 ACC checkpoint，则先导出整批 DTF 归档，再独立运行 ACC。全量导出保留每个样本的完整张量，建议按单个 NPZ 和图片目录的实际大小估算可用磁盘。只导出使用 `export --all-samples`。
