@@ -430,3 +430,25 @@ def test_projected_aligned_mask_and_axis_orientation():
         images, stats = projected_scene(data, prepare_context(data))
     assert images['current_gt'] is None and images['dtf_visible'] is None
     assert len(stats['warnings']) == 2
+
+
+def test_two_scene_comparison(tmp_path):
+    from tools.analysis_tools.dtf_comparison import select_rows, render_comparison
+    data = scene_arrays(1)
+    data['visible_zyx'][:] = True
+    first = tmp_path / 'sample_000001.npz'
+    save_archive(first, data)
+    with pytest.raises(ValueError, match='distinct scenes'):
+        select_rows([first])
+    data['scene_token'] = 'second'
+    data['sample_token'] = 'second-now'
+    data['visible_zyx'][1, 1, 5] = False
+    save_archive(tmp_path / 'sample_000002.npz', data)
+    render_comparison(parse_args(['compare', str(tmp_path), '--dpi', '80']))
+    import json
+    result = json.loads((tmp_path / 'acc_dtf_comparison.json').read_text())
+    assert result['radius_m'] == 2.4
+    assert [row['reason'] for row in result['rows']] == ['semantic boundary', 'historically visible']
+    for stem in ('acc_dtf_comparison', 'row1_xyz_diagnostic', 'row2_xyz_diagnostic'):
+        assert (tmp_path / (stem + '.pdf')).read_bytes().startswith(b'%PDF')
+        assert (tmp_path / (stem + '.png')).exists()

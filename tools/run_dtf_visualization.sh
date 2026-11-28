@@ -10,7 +10,7 @@ done
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 
 case "${1:-}" in
-  run|export|plot|-h|--help) ;;
+  run|export|plot|compare|-h|--help) ;;
   *) set -- run "$@" ;;
 esac
 

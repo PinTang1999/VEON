@@ -20,6 +20,12 @@ def parse_args(argv=None):
     run = modes.add_parser('run', help='export samples and render figures')
     export = modes.add_parser('export', help='export sample archives on the GPU server')
     plot = modes.add_parser('plot', help='render sample archives with NumPy and Matplotlib')
+    compare = modes.add_parser('compare', help='render a two-scene ACC/DTF publication comparison')
+    compare.add_argument('npz', type=Path, help='directory of version 2 sample_*.npz archives')
+    compare.add_argument('--out-dir', type=Path)
+    compare.add_argument('--radius', type=float, default=2.4)
+    compare.add_argument('--head', default='aggregate', help='one head index or aggregate')
+    compare.add_argument('--dpi', type=int, default=400)
     for command in (run, export):
         command.add_argument('--config', type=Path, default=Path(DEFAULT_CONFIG))
         command.add_argument('--checkpoint', type=Path, default=Path(DEFAULT_CHECKPOINT),
@@ -56,6 +62,8 @@ def parse_args(argv=None):
             command.add_argument('--' + flag, metavar='NPZ', help='optional prediction file or {token}/{index} template')
         command.add_argument('--dpi', type=int, default=300)
     args = parser.parse_args(argv)
+    if args.mode == 'compare' and args.head == 'all':
+        parser.error('compare accepts one head index or aggregate')
     if getattr(args, 'head', None) not in (None, 'all', 'aggregate'):
         try:
             args.head = int(args.head)
@@ -408,6 +416,9 @@ def export_acc_predictions(args, paths):
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.mode == 'compare':
+        from tools.analysis_tools.dtf_comparison import render_comparison
+        return render_comparison(args)
     if args.mode == 'plot':
         paths = sorted(args.npz.glob('sample_*.npz')) if args.npz.is_dir() else [args.npz]
         if not paths:

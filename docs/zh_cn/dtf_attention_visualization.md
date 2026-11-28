@@ -154,3 +154,16 @@ python -m pytest -q tests/test_dtf_visualization.py tests/test_models/test_veon_
 ```
 
 真实 CUDA 推理、nuScenes 的场景对齐、T2/T3 训练权重、独立训练 baseline 以及跨样本的实际统计，分别使用上面的服务器命令验证。
+
+## 两场景 ACC / DTF 对比图
+
+在服务器导出多个包含 GT 和相机掩码的 v2 样本，再在服务器或 Mac 绘图。
+
+```bash
+bash tools/run_dtf_visualization.sh export --num-samples 12 --distinct-scenes --out-dir work_dirs/dtf_cases
+bash tools/run_dtf_visualization.sh compare work_dirs/dtf_cases --radius 2.4 --head aggregate --out-dir work_dirs/dtf_comparison
+```
+
+输出 `acc_dtf_comparison.{png,pdf,json}` 和两行对应的 `row{1,2}_xyz_diagnostic.{png,pdf}`。第一行根据当前可见 GT 的语义边界选点，优先可移动类别。第二行优先历史可见、当前不可见的前景体素，也可选择对齐后双方可见但语义不同的体素。后一条件不能单独证明物体运动。程序要求两个不同场景，JSON 记录实际采用的依据和历史帧 token。
+
+灰点是一个单位膨胀率 3×3×3 卷积在 DTF 网格上的理论采样中心的 XY 投影。虚框覆盖这九个投影体素的完整格面范围。后三列共用相机可见的 DTF 首命中俯视预测。彩色圆点投影所有实际采样高度，颜色及面积使用原始概率。aggregate 保留每个 head 的独立端点。T3 的历史分支使用递归融合特征，历史 GT 列展示 JSON 指定的单帧背景。
