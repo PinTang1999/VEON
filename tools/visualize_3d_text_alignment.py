@@ -5,7 +5,7 @@ then plots them. Plot-only needs NumPy, scikit-learn and Matplotlib.
 """
 import argparse
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import json
 from pathlib import Path
 import sys
@@ -28,6 +28,7 @@ def parse_args(argv=None):
     p.add_argument('--checkpoint', type=Path, help='trained occupancy checkpoint (extract/all)')
     p.add_argument('--output-dir', '--output_dir', type=Path,
                    default=Path('work_dirs/visualizations/3d_text_alignment'))
+    p.add_argument('--plot-dir', type=Path, help='plot-only destination (default: the feature directory)')
     p.add_argument('--samples-per-class', '--samples_per_class', type=int, default=300,
                    help='target per occupied GT superclass')
     p.add_argument('--max-scenes', '--max_scenes', type=int, default=20,
@@ -40,9 +41,23 @@ def parse_args(argv=None):
     p.add_argument('--batch-size', '--batch_size', type=int, choices=[1], default=1,
                    help='VeonTemporal.simple_test returns one keyframe per forward')
     p.add_argument('--dpi', type=int, default=350, help='PNG resolution')
-    p.add_argument('--text-labels', choices=('names', 'none'), default='names')
+    p.add_argument('--text-labels', choices=('none', 'representative', 'names'), default='representative',
+                   help='annotate none, predefined name/mapping matches, or all text prototypes')
+    p.add_argument('--tsne-samples-per-class', type=int, default=100,
+                   help='voxel cap per GT class for projection only; 0 keeps all bank rows')
+    p.add_argument('--cosine-vmin', type=float, help='lower color limit for raw voxel–text heatmaps')
+    p.add_argument('--cosine-vmax', type=float, help='upper color limit for raw voxel–text heatmaps')
     p.add_argument('--cosine-limit', type=float, help='fixed symmetric heatmap limits (+/- value)')
     args = p.parse_args(argv)
+    if args.tsne_samples_per_class < 0:
+        p.error('--tsne-samples-per-class must be nonnegative')
+    bounds = [v for v in (args.cosine_vmin, args.cosine_vmax) if v is not None]
+    if any(not -1 <= v <= 1 for v in bounds) or (len(bounds) == 2 and bounds[0] >= bounds[1]):
+        p.error('cosine color bounds must be in [-1,1] with vmin < vmax')
+    if bounds and args.cosine_limit is not None:
+        p.error('choose either --cosine-limit or --cosine-vmin/--cosine-vmax')
+    if args.mode != 'plot' and args.plot_dir is not None:
+        p.error('--plot-dir selects a separate destination for plot-only mode')
     if args.mode != 'plot':
         args.random_seed = 42 if args.random_seed is None else args.random_seed
         args.perplexity = 30 if args.perplexity is None else args.perplexity
@@ -361,8 +376,14 @@ def main(argv=None):
     out = args.output_dir
     if args.mode != 'plot':
         out.mkdir(parents=True, exist_ok=True)
-    with (out / '.alignment.lock').open('a+b') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    dest = args.plot_dir or out
+    if args.plot_dir is not None:
+        dest.mkdir(parents=True, exist_ok=True)
+    # Serialize readers with extraction, and concurrent writers to a shared destination.
+    with ExitStack() as stack:
+        for directory in sorted({out.resolve(), dest.resolve()}):
+            lock = stack.enter_context((directory / '.alignment.lock').open('a+b'))
+            fcntl.flock(lock, fcntl.LOCK_EX)
         if args.mode != 'plot':
             with staged_outputs(out) as stage:
                 extract(args, stage)
@@ -370,9 +391,9 @@ def main(argv=None):
             for name in PLOT_FILES:
                 (out / name).unlink(missing_ok=True)
         if args.mode != 'extract':
-            with staged_outputs(out) as stage:
+            with staged_outputs(dest) as stage:
                 plot_alignment(out, stage, args)
-    print(f'Saved {args.mode} outputs in {out.resolve()}')
+    print(f'Saved {args.mode} outputs in {dest.resolve()}')
 
 
 if __name__ == '__main__':
